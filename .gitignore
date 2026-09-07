@@ -1,0 +1,22 @@
+# build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.asi
+*.tlog
+*.log
+*.user
+.vs/
+*.iobj
+*.ipdb
+
+# python
+__pycache__/
+*.pyc
