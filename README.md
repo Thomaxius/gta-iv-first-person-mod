@@ -25,8 +25,7 @@ x86 DLL, `/MT`, no PCH, output extension `.asi`, drop next to `GTAIV.exe`
 | ↑ / ↓ | mouse sensitivity + / − (in mode 3) |
 | PgUp / PgDn | FOV + / − |
 | 7 / 8 | cycle which cutscene actor the camera follows |
-| N | hair on / off |
-| J | force head-hide off (it's automatic in first person) |
+| J | force head-hide off (it's automatic in first person; hair goes with it) |
 | B | head-bone rotation test; then ← / → pick the bone axis |
 | F6 | native invoker on / off (on by default — debug only) |
 | F8 | dump diagnostics to `FirstPersonCutscene.log` |
@@ -47,7 +46,9 @@ vehicle** — the keys tune whichever context you're currently in.
   auto-applied whenever first person is active.
 - **Look:** absolute world yaw, seeded once per FP session / per cutscene and moved
   only by the mouse, so strafing and shot cuts don't drag the view. In a vehicle
-  the base yaw tracks the vehicle heading.
+  the base yaw tracks the vehicle heading. `IS_PED_RAGDOLL` auto-switches to the
+  head bone's own rotation while you're down, so getting hit and tumbling actually
+  rolls the camera with your head.
 
 ## Contributing 
 Feel free to help me make this better in every way. Hit me up in Discord or create issues in Github.

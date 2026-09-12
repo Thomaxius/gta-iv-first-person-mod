@@ -30,7 +30,7 @@
 // Keys:  F7 enable   F10 mode (3 = FP)   F6 natives on/off   F8 diagnostics dump
 //        F9 recenter view      F11/F12 eye height -/+     Left/Right eye forward
 //        PgUp/PgDn FOV      B head-bone rotation test     J force head-hide off
-//        N hair on/off      7/8 cutscene actor slot
+//        7/8 cutscene actor slot
 // Eye height / forward / FOV are stored per context (on foot vs in a vehicle).
 //
 // Build: x86 DLL, /MT, no PCH, output extension .asi, next to GTAIV.exe.
@@ -84,6 +84,7 @@ static volatile int   g_csSlotOK[CS_SLOTS] = { 0 };
 static volatile int   g_csIndex = 0;             // which cutscene-ped slot the camera follows ('[' / ']')
 static volatile int   g_inTrain = 0;
 static volatile int   g_inCar = 0;
+static volatile int   g_isRagdoll = 0;   // IS_PED_RAGDOLL(player) -- auto-switches to head-bone rotation
 static volatile int   g_playerPed = 0;
 static volatile float g_charHeading = 0;
 static volatile int   g_headingOK = 0;
@@ -400,7 +401,7 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
                 void* ped = g_FindPlayerPed(0);
                 float* m = ped ? *(float**)((char*)ped + 0x20) : nullptr;
                 if (m) { hx = m[12]; hy = m[13]; hz = m[14] + 0.55f; }
-                else   { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
+                else { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
             }
             else if (!inCs && g_headMtxOK)
             {
@@ -459,17 +460,22 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             g_pickX = hx; g_pickY = hy; g_pickZ = hz;
 
             // base orientation:
-            //  - g_boneRot: the head bone's own matrix (true head tracking); g_fwdRow
-            //    picks which bone axis is "look", g_fwdSign flips it
+            //  - g_boneRot (manual) or g_isRagdoll (auto): the head bone's own matrix
+            //    (true head tracking) -- so getting knocked down / ragdolling actually
+            //    tumbles the view instead of it staying locked to one direction.
+            //    g_fwdRow picks which bone axis is "look", g_fwdSign flips it.
             //  - else g_headingOK: Niko's heading (locks yaw to his facing)
             //  - else: the incoming shot/gameplay camera direction
             float R[3], F[3];
-            if (g_boneRot && g_headMtxOK && !inCs)
+            if ((g_boneRot || g_isRagdoll) && g_headMtxOK && !inCs)
             {
                 int fr = g_fwdRow & 3; if (fr > 2) fr = 0;
                 int rr = (fr + 1) % 3;
                 F[0] = g_headMtx[fr * 4 + 0]; F[1] = g_headMtx[fr * 4 + 1]; F[2] = g_headMtx[fr * 4 + 2];
-                R[0] = g_headMtx[rr * 4 + 0]; R[1] = g_headMtx[rr * 4 + 1]; R[2] = g_headMtx[rr * 4 + 2];
+                // the bone matrix's "rr" row is the LEFT vector, not right (its up row
+                // matches R x F only once negated -- confirmed against the bone's own
+                // up row: without this, R x F pointed down and the view was upside down)
+                R[0] = -g_headMtx[rr * 4 + 0]; R[1] = -g_headMtx[rr * 4 + 1]; R[2] = -g_headMtx[rr * 4 + 2];
             }
             else if (inCs)
             {
@@ -608,9 +614,9 @@ typedef void(__cdecl* voidfn_t)();
 static voidfn_t      g_origGameProcess = nullptr;
 
 // ---- hide the player's head via SET_DRAW_PLAYER_COMPONENT (proper native) -----
-// components: 0 HEAD, 7 HAIR, 9 TEEF, 10 FACE
+// components: 0 HEAD, 7 HAIR, 9 TEEF, 10 FACE -- hair always goes with the head,
+// nobody wants it floating in mid-air once the head's gone.
 static volatile int   g_hideHead = 1;   // auto-hides whenever FP (mode 3) is active
-static volatile int   g_hideHair = 1;   // also drop the hair (it'd float otherwise)
 
 static void OnGameFrame()
 {
@@ -870,6 +876,7 @@ static void PollNativesInner()
     static NativeFn fBonePos = NatFn(0x43475BB3);   // GET_PED_BONE_POSITION(ped,tag,ox,oy,oz,&v)
     static NativeFn fInTrain = NatFn(0x22434C20);   // IS_CHAR_IN_ANY_TRAIN(ped)
     static NativeFn fInCar = NatFn(0x71184DA3);   // IS_CHAR_IN_ANY_CAR(ped)
+    static NativeFn fRagdoll = NatFn(0x3E251ADE);   // IS_PED_RAGDOLL(ped)
     static NativeFn fDrawComp = NatFn(0x3EFE3DC8);   // SET_DRAW_PLAYER_COMPONENT(comp,draw)
     static NativeFn fCsPed = NatFn(0x366B549F);   // GET_CUTSCENE_PED_POSITION(idx,&v)
     static NativeFn fHeading = NatFn(0x057A3AC7);   // GET_CHAR_HEADING(ped) -> float
@@ -921,35 +928,34 @@ static void PollNativesInner()
     }
     if (fInTrain && ped) { NativeCtx a; a.pushI(ped); fInTrain(&a); g_inTrain = a.resI() ? 1 : 0; }
     if (fInCar && ped) { NativeCtx a; a.pushI(ped); fInCar(&a); g_inCar = a.resI() ? 1 : 0; }
+    if (fRagdoll && ped)
+    {
+        NativeCtx a; a.pushI(ped); fRagdoll(&a);
+        int rd = a.resI() ? 1 : 0;
+        if (rd != g_isRagdoll)
+        {
+            g_lookYaw = 0.0f; g_lookPitch = 0.0f;   // don't add a stale mouse offset to the tumble
+            if (!rd) g_seedYawSet = 0;              // back on your feet -- reseed the look yaw
+        }
+        g_isRagdoll = rd;
+    }
 
-    // hide / restore the head (+ teeth/face, and optionally hair) via the native.
-    // apply on change, and re-apply every ~2 s so it survives a model reload.
+    // hide / restore the head + teeth/face + hair via the native. apply on change,
+    // and re-apply every ~2 s so it survives a model reload.
     if (fDrawComp)
     {
-        static int   applied = 0;
-        static int   lastState = -1;      // -1 none, 0 shown, 1 hidden(no hair), 2 hidden(hair)
+        static int   lastState = -1;      // -1 none, 0 shown, 1 hidden
         static uint32_t nextReapply = 0;
         bool fpActive = g_enabled && g_mode == 3;
-        int want = (fpActive && g_hideHead) ? (g_hideHair ? 2 : 1) : 0;
+        int want = (fpActive && g_hideHead) ? 1 : 0;
         uint32_t now = (uint32_t)g_natTimer;
         if (want != lastState || (want != 0 && now >= nextReapply))
         {
             lastState = want;
             nextReapply = now + 2000;
-            if (want == 0)
-            {
-                for (int c = 0; c < 11; ++c) { NativeCtx a; a.pushI(c); a.pushI(1); fDrawComp(&a); }
-            }
-            else
-            {
-                int comps[4] = { 0, 9, 10, 7 };            // HEAD, TEEF, FACE, HAIR
-                int ncomp = (want == 2) ? 4 : 3;
-                for (int i = 0; i < ncomp; ++i) { NativeCtx a; a.pushI(comps[i]); a.pushI(0); fDrawComp(&a); }
-                if (want == 1) { NativeCtx a; a.pushI(7); a.pushI(1); fDrawComp(&a); }  // hair back on
-            }
-            applied = 1;
+            static const int comps[4] = { 0, 9, 10, 7 };   // HEAD, TEEF, FACE, HAIR
+            for (int i = 0; i < 4; ++i) { NativeCtx a; a.pushI(comps[i]); a.pushI(want ? 0 : 1); fDrawComp(&a); }
         }
-        (void)applied;
     }
     if (fHeading && ped) {
         float h = 0; NativeCtx a; a.pushI(ped); a.pushP(&h); fHeading(&a);
@@ -1030,12 +1036,12 @@ static void PollNatives()
 static DWORD WINAPI Worker(LPVOID)
 {
     Log("Worker started");
-    const int N = 18;
+    const int N = 17;
     bool k[N] = { 0 };
     const int vk[N] = { VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
                         VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_F6,
                         '7' /* cs slot - */, '8' /* cs slot + */, 'B' /* head-bone rotation */,
-                        'J' /* hide head */, 'N' /* hair on/off */,
+                        'J' /* hide head */,
                         VK_NEXT /* PgDn: FOV - */, VK_PRIOR /* PgUp: FOV + */ };
     int dn = 0; uint32_t tick = 0;
     for (;;)
@@ -1046,12 +1052,13 @@ static DWORD WINAPI Worker(LPVOID)
         const char* ctx = vi ? "car" : "foot";
         // arrows: mode 3 = look around; other modes = push/fwd tuning
         if (d[10] && !k[10]) { g_useNatives = !g_useNatives; Log("F6 useNatives=%d", g_useNatives); }
-        if (d[13] && !k[13]) { g_boneRot = !g_boneRot; g_lookYaw = g_lookPitch = 0;
-                               Log("B boneRot=%d (look reset)", g_boneRot); }
+        if (d[13] && !k[13]) {
+            g_boneRot = !g_boneRot; g_lookYaw = g_lookPitch = 0;
+            Log("B boneRot=%d (look reset)", g_boneRot);
+        }
         if (d[14] && !k[14]) { g_hideHead = !g_hideHead; Log("J hideHead=%d", g_hideHead); }
-        if (d[15] && !k[15]) { g_hideHair = !g_hideHair; Log("N hideHair=%d", g_hideHair); }
-        if (d[16] && !k[16]) { g_fovBoostV[vi] -= 3.0f; if (g_fovBoostV[vi] < -20.0f) g_fovBoostV[vi] = -20.0f; Log("PgDn fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
-        if (d[17] && !k[17]) { g_fovBoostV[vi] += 3.0f; if (g_fovBoostV[vi] > 50.0f) g_fovBoostV[vi] = 50.0f; Log("PgUp fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
+        if (d[15] && !k[15]) { g_fovBoostV[vi] -= 3.0f; if (g_fovBoostV[vi] < -20.0f) g_fovBoostV[vi] = -20.0f; Log("PgDn fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
+        if (d[16] && !k[16]) { g_fovBoostV[vi] += 3.0f; if (g_fovBoostV[vi] > 50.0f) g_fovBoostV[vi] = 50.0f; Log("PgUp fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
         if (g_mode == 3)
         {
             if (d[8] && !k[8]) { g_mouseSens *= 1.25f; Log("mouseSens=%.5f", g_mouseSens); }
@@ -1074,8 +1081,10 @@ static DWORD WINAPI Worker(LPVOID)
             if (d[8] && !k[8]) { g_pushDist += 0.25f; Log("pushDist=%.2f", g_pushDist); }
             if (d[9] && !k[9]) { g_pushDist -= 0.25f; Log("pushDist=%.2f", g_pushDist); }
         }
-        if (d[0] && !k[0]) { g_enabled = g_enabled ? 0 : 1; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-                             Log("F7 enabled=%d", g_enabled); }
+        if (d[0] && !k[0]) {
+            g_enabled = g_enabled ? 0 : 1; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
+            Log("F7 enabled=%d", g_enabled);
+        }
         if (d[1] && !k[1])
         {
             ++dn;
@@ -1088,8 +1097,8 @@ static DWORD WINAPI Worker(LPVOID)
                 g_pickX, g_pickY, g_pickZ, g_fwdSign,
                 g_eyeTrimV[0], g_eyeFwdV[0], g_fovBoostV[0], g_eyeTrimV[1], g_eyeFwdV[1], g_fovBoostV[1],
                 g_lookYaw, g_lookPitch);
-            Log("  hideHead=%d hideHair=%d inCar=%d inTrain=%d incomingUp.z=%.2f",
-                g_hideHead, g_hideHair, g_inCar, g_inTrain, g_dstRot[8]);
+            Log("  hideHead=%d inCar=%d inTrain=%d ragdoll=%d incomingUp.z=%.2f",
+                g_hideHead, g_inCar, g_inTrain, g_isRagdoll, g_dstRot[8]);
             Log("  shotRot r0=(%.2f,%.2f,%.2f) r1=(%.2f,%.2f,%.2f) r2=(%.2f,%.2f,%.2f)",
                 g_dstRot[0], g_dstRot[1], g_dstRot[2], g_dstRot[3], g_dstRot[4], g_dstRot[5],
                 g_dstRot[6], g_dstRot[7], g_dstRot[8]);
@@ -1145,8 +1154,10 @@ static DWORD WINAPI Worker(LPVOID)
             if (g_mode != 3) g_fwdSign = !g_fwdSign;
             Log("F9 recenter (fwdSign=%d)", g_fwdSign);
         }
-        if (d[3] && !k[3]) { g_mode = (g_mode + 1) % 4; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-                             Log("F10 mode=%d", g_mode); }
+        if (d[3] && !k[3]) {
+            g_mode = (g_mode + 1) % 4; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
+            Log("F10 mode=%d", g_mode);
+        }
         if (d[4] && !k[4]) { g_eyeTrimV[vi] -= 0.03f; Log("F11 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
         if (d[5] && !k[5]) { g_eyeTrimV[vi] += 0.03f; Log("F12 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
         if (d[11] && !k[11]) { g_csIndex = (g_csIndex + CS_SLOTS - 1) % CS_SLOTS; Log("csIndex=%d (7)", g_csIndex); }
@@ -1154,10 +1165,10 @@ static DWORD WINAPI Worker(LPVOID)
         for (int i = 0; i < N; ++i) k[i] = d[i];
 
         if (++tick % 60 == 0)
-            Log("alive m=%d en=%d nat=%d fhh=%d gtid=%lu timer=%d ped=%d hdg=%.0f(%d) natOK=%d inTrain=%d inCar=%d head=(%.1f,%.1f,%.1f) csOK=%d csIdx=%d csPed=(%.1f,%.1f,%.1f) exc=%d ecode=0x%08X eaddr=0x%p cs='%s'",
+            Log("alive m=%d en=%d nat=%d fhh=%d gtid=%lu timer=%d ped=%d hdg=%.0f(%d) natOK=%d inTrain=%d inCar=%d ragdoll=%d head=(%.1f,%.1f,%.1f) csOK=%d csIdx=%d csPed=(%.1f,%.1f,%.1f) exc=%d ecode=0x%08X eaddr=0x%p cs='%s'",
                 g_mode, g_enabled, g_useNatives, g_frameHookHits, (unsigned long)g_gameThreadId,
                 g_natTimer, g_natDbgPed, g_charHeading, g_headingOK,
-                g_natOK, g_inTrain, g_inCar,
+                g_natOK, g_inTrain, g_inCar, g_isRagdoll,
                 g_headW[0], g_headW[1], g_headW[2], g_csPedOK, g_csIndex,
                 g_csPedW[0], g_csPedW[1], g_csPedW[2], g_pollExc,
                 (unsigned)g_pollExcCode, (void*)g_pollExcAddr,
@@ -1169,7 +1180,7 @@ static DWORD WINAPI Worker(LPVOID)
 
 static DWORD WINAPI Init(LPVOID)
 {
-    Log("=== Init  FirstPersonCutscene v0.1.0-beta ===");
+    Log("=== Init  FirstPersonCutscene v0.1.0-beta (fixed ragdoll up-vector flip) ===");
     Sleep(4000);
     if (!GetMainModuleRange(g_moduleBase, g_moduleSize)) { Log("module range failed"); return 0; }
     Log("module base=0x%p size=0x%X", (void*)g_moduleBase, (unsigned)g_moduleSize);
