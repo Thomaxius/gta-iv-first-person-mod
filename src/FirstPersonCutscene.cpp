@@ -425,9 +425,12 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
 
             // consume mouse ONCE per rendered frame (this hook fires several times/frame).
             // When GTA IV's idle camera takes over it rolls the shot cam and drives the
-            // mouse-delta globals to animate its drift -- detect that (incoming up.z far
-            // from +1) and freeze look input so the view doesn't get dragged / flipped.
-            bool camUpright = g_dstRot[8] > 0.60f;
+            // mouse-delta globals to animate its drift -- detect that (incoming up.z
+            // gone negative) and freeze look input so the view doesn't get dragged /
+            // flipped. Our own pitch is hard-clamped to +-1.30 rad (74.5 deg), so our
+            // own math can never produce a negative up.z -- 0.60 was too strict and
+            // falsely tripped on ordinary steep look-down (cos(74.5 deg) =~ 0.27).
+            bool camUpright = g_dstRot[8] > -0.20f;
             uint32_t fc = g_frameCount ? *g_frameCount : (g_hits >> 3);
             if (camUpright && fc != g_lastLookFrame)
             {
