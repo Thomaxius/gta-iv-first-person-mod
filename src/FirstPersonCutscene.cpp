@@ -51,8 +51,8 @@ static volatile int      g_mode = 1;        // 0 canary, 1 frozen, 2 push, 3 pla
 static volatile float    g_eyeUp = 0.60f;
 static volatile int      g_useNatives = 1;   // on by default now (F6 still toggles for debug)
 // per-context tuning: [0] = on foot, [1] = in a vehicle / train
-static volatile float    g_eyeFwdV[2] = { 0.16f, 0.05f };    // forward nudge toward the nose (pulled back a bit in a vehicle)
-static volatile float    g_eyeTrimV[2] = { 0.15f, 0.09f };   // up/down nudge (F11/F12)
+static volatile float    g_eyeFwdV[2] = { 0.20f, 0.05f };    // forward nudge toward the nose (pulled back a bit in a vehicle)
+static volatile float    g_eyeTrimV[2] = { 0.17f, 0.09f };   // up/down nudge (F11/F12)
 static volatile float    g_fovBoostV[2] = { 21.0f, 30.0f };   // extra FOV degrees (PgUp/PgDn)
 static volatile float    g_mouseSens = 0.0016f;
 static uint32_t* g_frameCount = nullptr;
@@ -405,7 +405,28 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             }
             else if (!inCs && g_headMtxOK)
             {
-                hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14];       // head bone matrix pos
+                // Same staleness fix as the vehicle branch above: g_headMtx is only
+                // refreshed once per SIM tick (the frame-hook poll), but this runs
+                // once per RENDERED frame. Under a heavier/uneven renderer (RTX Remix
+                // adds real GPU latency and can decouple render pacing from the sim
+                // tick) that gap becomes visible -- the camera trails a frame or more
+                // behind where the head bone actually is right now. GetBoneMatrix is a
+                // plain function pointer, not a script native, so it's exactly as
+                // legal to call from this render-thread hook as FindPlayerPed already
+                // is elsewhere in this function -- read it fresh here instead of
+                // trusting the cached copy.
+                bool freshOK = false;
+                if (g_GetBoneMtx && g_FindPlayerPed)
+                {
+                    void* pd = g_FindPlayerPed(0);
+                    if (pd)
+                    {
+                        float m[16];
+                        g_GetBoneMtx(pd, m, 1205);
+                        if (m[12] || m[13] || m[14]) { hx = m[12]; hy = m[13]; hz = m[14]; freshOK = true; }
+                    }
+                }
+                if (!freshOK) { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
             }
             else if (g_natOK)
             {
