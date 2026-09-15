@@ -55,7 +55,7 @@
 // actually pushed to GitHub; everything after it is unpublished local WIP until
 // the next real tag. Bump the alphaN suffix each time a new build gets handed
 // over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.2.1-alpha16"
+#define FPMOD_VERSION "0.2.1-alpha18"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
@@ -423,7 +423,30 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
                 // frame; the seated head sits ~0.55 above the ped matrix origin.
                 void* ped = g_FindPlayerPed(0);
                 float* m = ped ? *(float**)((char*)ped + 0x20) : nullptr;
-                if (m) { hx = m[12]; hy = m[13]; hz = m[14] + 0.55f; }
+                if (m)
+                {
+                    hx = m[12]; hy = m[13]; hz = m[14] + 0.55f;
+                    // Exiting a train: IS_CHAR_IN_ANY_TRAIN stays true for a second or
+                    // two into the stand-up-and-step-out animation, so this fixed
+                    // seated offset keeps getting applied while Niko's real skeleton
+                    // is already rising toward standing height -- pins the camera at
+                    // waist level while he's visibly stood up (2026-09-15, subway exit
+                    // F8 dump: real head bone climbed 0.4+ units above this formula's
+                    // output over several samples while inTrain was still 1, then
+                    // matched up again once it cleared). While genuinely seated the
+                    // real bone reads BELOW this formula every time (tuned to sit a
+                    // touch higher on purpose) -- so preferring whichever is higher
+                    // only ever kicks in once he's actually standing.
+                    //
+                    // HEIGHT ONLY, not X/Y: g_headMtx is a frame (or more) stale --
+                    // it's only refreshed once per SIM tick, same staleness this whole
+                    // branch exists to dodge for the ped root (see the fresh-read
+                    // comment above). Taking its X/Y too made the camera visibly lag
+                    // and warp sideways off Niko's real position on a fast-moving
+                    // train (2026-09-15 follow-up test) -- X/Y must stay on the
+                    // fresh-this-frame root read; only Z borrows the cached bone.
+                    if (g_headMtx[14] > hz) hz = g_headMtx[14];
+                }
                 else { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
             }
             else if (!inCs && g_headMtxOK)
