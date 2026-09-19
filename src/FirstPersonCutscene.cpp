@@ -55,7 +55,7 @@
 // actually pushed to GitHub; everything after it is unpublished local WIP until
 // the next real tag. Bump the alphaN suffix each time a new build gets handed
 // over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.2.1-alpha18"
+#define FPMOD_VERSION "0.3.1-alpha6"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
@@ -89,6 +89,20 @@ static int32_t* g_diMouseY = nullptr;
 typedef int(__thiscall* GetBoneMtx_t)(void* ped, void* outMtx, int boneTag);
 static GetBoneMtx_t g_GetBoneMtx = nullptr;
 static volatile int  g_boneRot = 0;            // 'B': use the head bone's own orientation as the FP base
+static volatile int  g_aimAlign = 1;           // 'K': while the game's aim camera is live, take yaw/pitch from it
+static volatile int  g_aimParallax = 1;        // 'L': ...and slide the eye onto its aim ray (crosshair == bullet line)
+static volatile int  g_aimSide = 0;            // 'M': aim-cam shoulder: 0 = centered over the head, 1 = game default (right), 2 = left
+static volatile int  g_aimVert = 0;            // 'N': also raise the aim ray to our eye height (experimental)
+static const float   kAimShoulder = 0.475f;    // the game's own shoulder offset = aim cam local x @ +0x1C0
+static volatile int  g_curWeapon = 0;          // GET_CURRENT_CHAR_WEAPON (weapon type id)
+static volatile int  g_curWeaponSlot = -1;     // GET_WEAPONTYPE_SLOT of it (gun category)
+static volatile int  g_aimActive = 0;          // the aim camera is live (set by the camera hook)
+static volatile float g_aimFwdW[128] = { 0 };  // per-weapon extra eye-forward while aiming, metres (long guns' stocks clip the screen)
+// fallback per weapon slot, so guns of one category inherit a tuned value. Slot 5 = assault
+// rifles (M4 = weapon 15, AK47, ...): -0.08 tuned in-game 2026-09-19 -- pulling the eye BACK
+// 8 cm is what stops the stock clipping the screen (other slots untuned = 0).
+static volatile float g_aimFwdSlot[16] = { 0, 0, 0, 0, 0, -0.08f };
+static const uintptr_t kAimCamVtblRva = 0xA9B98C;   // CCamAimWeapon vtable, 1.2.0.59 (found via the aim-cam pool dump)
 
 // native-fed state (polled on the worker thread, read by the camera hook)
 static volatile int   g_natOK = 0;
@@ -391,6 +405,89 @@ static void InstallMouseHook()
 
 static void PollNatives();     // fwd decl -- called here so natives run on the main thread
 
+static float WrapPi(float a)
+{
+    while (a > 3.14159265f) a -= 6.28318531f;
+    while (a < -3.14159265f) a += 6.28318531f;
+    return a;
+}
+
+// The game's aim camera (CCamAimWeapon) only exists in the camera pool while
+// aiming. Its frame is the game's real aim ray and the ped's heading follows it.
+// Returns the frame matrix (right@0 fwd@4 up@8 pos@12, floats) or null.
+static const float* FindAimCamFrame()
+{
+    Pool cp;
+    if (!ReadPool(g_pCamPoolPtr, cp, 0x100)) return nullptr;
+    const uintptr_t want = g_moduleBase + kAimCamVtblRva;
+    for (int i = 0; i < cp.size; ++i)
+    {
+        if (cp.flags[i] & 0x80) continue;
+        uint8_t* o = cp.storage + (size_t)i * cp.stride;
+        if (*(uintptr_t*)o != want) continue;
+        const float* m = (const float*)(o + 0x10);
+        const float l = m[4] * m[4] + m[5] * m[5] + m[6] * m[6];
+        if (l < 0.9f || l > 1.1f) return nullptr;
+        return m;
+    }
+    return nullptr;
+}
+
+// The aim camera's pivot = head + a shoulder offset the game rotates into world space
+// every tick from a LOCAL offset vector at +0x1C0 (x right, y fwd, z up; the game's
+// value is x = 0.475, measured: world offset at +0x1B0 == right-vector * 0.475 at every
+// heading). That pivot is what the bullet ray goes through. Rewriting the local x makes
+// the aim ray start over the head (0) or the left shoulder (-0.475) instead of the
+// right one, so the eye no longer has to slide sideways to line up. Sim thread, once per
+// tick after the game's own update, so the next tick's camera update reads our value.
+static void ApplyAimCamOffset()
+{
+    if (!g_enabled || g_mode != 3 || !g_aimAlign || g_aimSide == 1) return;
+    if (g_inCar || g_inTrain || g_isRagdoll || (g_cutsceneName && g_cutsceneName[0])) return;
+    Pool cp;
+    if (!ReadPool(g_pCamPoolPtr, cp, 0x100) || cp.stride < 0x1D0) return;
+    const uintptr_t want = g_moduleBase + kAimCamVtblRva;
+    __try {
+        for (int i = 0; i < cp.size; ++i)
+        {
+            if (cp.flags[i] & 0x80) continue;
+            uint8_t* o = cp.storage + (size_t)i * cp.stride;
+            if (*(uintptr_t*)o != want) continue;
+            float* ofs = (float*)(o + 0x1C0);
+            ofs[0] = (g_aimSide == 2) ? -kAimShoulder : 0.0f;
+            if (g_aimVert) ofs[2] = g_eyeTrimV[0];
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Extra eye-forward while aiming for the current weapon. A long gun's stock ends up
+// beside/behind the eye and pokes into view (clips at the screen edge); pushing the eye
+// forward puts the stock behind the camera plane. Per-weapon value first, then the value
+// tuned for its slot (category), else 0. Moving along the view direction keeps the eye on
+// the aim ray, so accuracy is unaffected.
+static float EffectiveAimFwd()
+{
+    const int w = g_curWeapon, sl = g_curWeaponSlot;
+    if (w >= 0 && w < 128 && g_aimFwdW[w] != 0.f) return g_aimFwdW[w];
+    if (sl >= 0 && sl < 16) return g_aimFwdSlot[sl];
+    return 0.f;
+}
+
+static void AdjustAimFwd(float d)
+{
+    const int w = g_curWeapon, sl = g_curWeaponSlot;
+    if (w < 0 || w >= 128) return;
+    float v = EffectiveAimFwd() + d;
+    if (v > 0.60f) v = 0.60f;
+    if (v < -0.40f) v = -0.40f;
+    if (fabsf(v) < 0.001f) v = 0.f;
+    g_aimFwdW[w] = v;
+    if (sl >= 0 && sl < 16) g_aimFwdSlot[sl] = v;
+    Log("aimFwd weapon=%d slot=%d = %.2f", w, sl, v);
+}
+
 // ---- hook body -------------------------------------------------
 static uint32_t g_lastPollFrame = 0;
 static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully populated
@@ -490,6 +587,45 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             const int vi = g_inTrain ? 2 : (g_inCar ? 1 : 0);                    // 0 foot, 1 car, 2 train
             hz += g_eyeTrimV[vi];                                                 // F11/F12 fine nudge
 
+            // Aim alignment. The game aims from its own aim camera (CCamAimWeapon), not
+            // from the final matrix we overwrite, and that camera's yaw/pitch drift away
+            // from our own mouse integration (measured: 0-10 deg yaw, -8..+3 deg pitch
+            // apart, plus a ~0.4 m shoulder offset) -- so shots miss the crosshair.
+            // While the aim camera is live, take its yaw/pitch, converging from our old
+            // view over ~80 ms so entering aim doesn't snap.
+            static float s_offYaw = 0.f, s_offPitch = 0.f, s_eyeW = 0.f, s_shift[3] = { 0.f, 0.f, 0.f };
+            static bool  s_aimWas = false;
+            static LONGLONG s_aimQpc = 0; static double s_qpcInv = 0.0;
+            const float* aimF = nullptr;
+            if (g_aimAlign && g_seedYawSet && !inCs && !g_inCar && !g_inTrain && !g_isRagdoll && !g_boneRot)
+                aimF = FindAimCamFrame();
+            {
+                if (s_qpcInv == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); s_qpcInv = 1.0 / (double)qf.QuadPart; }
+                LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+                float dt = s_aimQpc ? (float)((qn.QuadPart - s_aimQpc) * s_qpcInv) : 0.f;
+                s_aimQpc = qn.QuadPart;
+                if (dt < 0.f || dt > 0.25f) dt = 0.f;
+                const float k = expf(-dt / 0.08f);      // dt==0 on repeat calls within a frame -> no-op
+                if (aimF)
+                {
+                    const float aimYaw = atan2f(-aimF[4], aimF[5]);
+                    const float aimPitch = asinf(fmaxf(-1.f, fminf(1.f, aimF[6])));
+                    if (!s_aimWas)
+                    {
+                        s_offYaw = WrapPi(g_seedYaw + g_lookYaw - aimYaw);
+                        s_offPitch = g_lookPitch - aimPitch;
+                        s_aimWas = true;
+                    }
+                    s_offYaw *= k; s_offPitch *= k;
+                    g_lookYaw = WrapPi(aimYaw + s_offYaw - g_seedYaw);
+                    g_lookPitch = fmaxf(-1.40f, fminf(1.40f, aimPitch + s_offPitch));   // game's aim pitch limit is ~1.396
+                    s_eyeW += (1.f - s_eyeW) * (1.f - k);
+                }
+                else { s_aimWas = false; s_eyeW *= k; }
+            }
+
+            g_aimActive = aimF ? 1 : 0;
+
             // consume mouse ONCE per rendered frame (this hook fires several times/frame).
             // When GTA IV's idle camera takes over it rolls the shot cam and drives the
             // mouse-delta globals to animate its drift -- detect that (incoming up.z
@@ -499,7 +635,14 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             // falsely tripped on ordinary steep look-down (cos(74.5 deg) =~ 0.27).
             bool camUpright = g_dstRot[8] > -0.20f;
             uint32_t fc = g_frameCount ? *g_frameCount : (g_hits >> 3);
-            if (camUpright && fc != g_lastLookFrame)
+            if (aimF)
+            {
+                // the aim camera owns yaw/pitch right now -- drain so nothing bursts when it ends
+                g_lastLookFrame = fc;
+                InterlockedExchange(&g_mouseDX, 0);
+                InterlockedExchange(&g_mouseDY, 0);
+            }
+            else if (camUpright && fc != g_lastLookFrame)
             {
                 g_lastLookFrame = fc;
                 float mdx = 0, mdy = 0;
@@ -612,6 +755,33 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             dst[14] = hz + F[2] * g_eyeFwdV[vi];
             g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
 
+            // Parallax: slide the eye sideways/vertically onto the aim ray (the component
+            // of the aim camera's offset perpendicular to the view), so the crosshair ray
+            // and the game's aim ray are the same line. Fades in/out with the aim camera.
+            if (aimF && g_aimParallax)
+            {
+                const float dx = aimF[12] - dst[12], dy = aimF[13] - dst[13], dz = aimF[14] - dst[14];
+                const float along = dx * F[0] + dy * F[1] + dz * F[2];
+                const float sx = dx - along * F[0], sy = dy - along * F[1], sz = dz - along * F[2];
+                if (sx * sx + sy * sy + sz * sz < 4.0f) { s_shift[0] = sx; s_shift[1] = sy; s_shift[2] = sz; }
+            }
+            if (g_aimParallax && s_eyeW > 0.001f)
+            {
+                dst[12] += s_shift[0] * s_eyeW; dst[13] += s_shift[1] * s_eyeW; dst[14] += s_shift[2] * s_eyeW;
+                g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
+            }
+
+            // Weapon-aware eye-forward while aiming (fades with the aim camera).
+            if (s_eyeW > 0.001f)
+            {
+                const float af = EffectiveAimFwd() * s_eyeW;
+                if (af != 0.f)
+                {
+                    dst[12] += F[0] * af; dst[13] += F[1] * af; dst[14] += F[2] * af;
+                    g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
+                }
+            }
+
             // FOV: dst[20] (matrix+0x50) is the field of view, already copied in by
             // the stolen bytes. widen it a touch.
             if (g_fovBoostV[vi] != 0.0f)
@@ -693,6 +863,7 @@ static void OnGameFrame()
     ++g_frameHookHits;
     g_gameThreadId = GetCurrentThreadId();
     if (g_useNatives) PollNatives();
+    ApplyAimCamOffset();
 }
 
 __declspec(naked) void FrameStub()
@@ -953,6 +1124,9 @@ static void PollNativesInner()
     static NativeFn fCharModel = NatFn(0x0A3D60CE);   // GET_CHAR_MODEL(ped,&model)
     static NativeFn fPedModelFromIdx = NatFn(0x124D4571);   // GET_PED_MODEL_FROM_INDEX(idx,&model) -- guess: cutscene slot idx, same space as GET_CUTSCENE_PED_POSITION
 
+    static NativeFn fCurWeapon = NatFn(0x5AB8289F);   // GET_CURRENT_CHAR_WEAPON(ped,&weapon)
+    static NativeFn fWeapSlot = NatFn(0x5E4F6DE3);    // GET_WEAPONTYPE_SLOT(weapon,&slot)
+
     if (!g_natLogged)
     {
         g_natLogged = 1;
@@ -1008,6 +1182,19 @@ static void PollNativesInner()
     }
     if (fInTrain && ped) { NativeCtx a; a.pushI(ped); fInTrain(&a); g_inTrain = a.resI() ? 1 : 0; }
     if (fInCar && ped) { NativeCtx a; a.pushI(ped); fInCar(&a); g_inCar = a.resI() ? 1 : 0; }
+    if (fCurWeapon && ped)
+    {
+        uint32_t w = 0; NativeCtx a; a.pushI(ped); a.pushP(&w); fCurWeapon(&a);
+        static int s_lastW = -1;
+        if ((int)w != s_lastW)
+        {
+            s_lastW = (int)w; g_curWeapon = (int)w;
+            int32_t sl = -1;
+            if (fWeapSlot) { NativeCtx b; b.pushI((int32_t)w); b.pushP(&sl); fWeapSlot(&b); }
+            g_curWeaponSlot = sl;
+            Log("weapon changed: type=%d slot=%d", (int)w, (int)sl);
+        }
+    }
     if (fRagdoll && ped)
     {
         NativeCtx a; a.pushI(ped); fRagdoll(&a);
@@ -1377,24 +1564,110 @@ static void PollNatives()
     }
 }
 
+// Aim-accuracy diagnostics. The game aims from its own camera objects
+// (CCamAimWeapon etc. -- each has its own frame at +0x10 and pitch/heading
+// fields), not from the final camera matrix we overwrite, so shots can diverge
+// from our view. Dumps every live camera-pool object next to our view angles.
+static void DumpAimState(const char* tag)
+{
+    const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    Log("  aim[%s] rmb=%d lmb=%d charHdg=%.1fdeg seedYaw=%.2f lookYaw=%.2f lookPitch=%.2f inCs=%d ragdoll=%d align=%d parallax=%d side=%d vert=%d weapon=%d slot=%d aimFwd=%.2f",
+        tag, (int)rmb, (int)lmb, g_charHeading, g_seedYaw, g_lookYaw, g_lookPitch,
+        (int)(g_cutsceneName && g_cutsceneName[0]), g_isRagdoll, g_aimAlign, g_aimParallax, g_aimSide, g_aimVert,
+        g_curWeapon, g_curWeaponSlot, EffectiveAimFwd());
+    __try {
+        Pool cp;
+        if (ReadPool(g_pCamPoolPtr, cp, 0x100))
+        {
+            for (int i = 0; i < cp.size; ++i)
+            {
+                if (cp.flags[i] & 0x80) continue;
+                uint8_t* o = cp.storage + i * cp.stride;
+                const uintptr_t vt = *(uintptr_t*)o;
+                const float* m = (const float*)(o + 0x10);
+                float f144 = 0, f148 = 0;
+                if (cp.stride >= 0x150) { f144 = *(float*)(o + 0x144); f148 = *(float*)(o + 0x148); }
+                Log("    cam[%2d] vt=+0x%X fwd=(%.2f,%.2f,%.2f) pos=(%.1f,%.1f,%.1f) fov=%.1f f144=%.3f f148=%.3f",
+                    i, (unsigned)(vt - g_moduleBase), m[4], m[5], m[6], m[12], m[13], m[14], m[20], f144, f148);
+                // F8 only: raw floats of the aim camera, to locate its own yaw/pitch fields
+                if (tag[0] == 'F' && vt == g_moduleBase + kAimCamVtblRva && cp.stride >= 0x1D0)
+                    for (int r = 0x110; r < 0x1D0; r += 0x20)
+                    {
+                        const float* q = (const float*)(o + r);
+                        Log("      +0x%03X: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f", r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+                    }
+                // F8 only: work out the aim cam's shoulder offset (camera-space R/F/U from its
+                // pivot at +0x140) and its yaw/pitch, then flag every float in the object
+                // that equals one of them -- points straight at the fields we'd need to zero.
+                if (tag[0] == 'F' && vt == g_moduleBase + kAimCamVtblRva)
+                {
+                    const int lim = cp.stride < 0x400 ? cp.stride : 0x400;
+                    const float px = *(float*)(o + 0x140), py = *(float*)(o + 0x144), pz = *(float*)(o + 0x148);
+                    const float dx = m[12] - px, dy = m[13] - py, dz = m[14] - pz;
+                    const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                    const float yaw = atan2f(-m[4], m[5]);
+                    const float pit = asinf(fmaxf(-1.f, fminf(1.f, m[6])));
+                    const float offR = dx * m[0] + dy * m[1] + dz * m[2];
+                    const float offF = dx * m[4] + dy * m[5] + dz * m[6];
+                    const float offU = dx * m[8] + dy * m[9] + dz * m[10];
+                    Log("      aimcam stride=0x%X pivot=(%.2f,%.2f,%.2f) yaw=%.4f pitch=%.4f offset R/F/U=(%.3f,%.3f,%.3f) dist=%.3f",
+                        (unsigned)cp.stride, px, py, pz, yaw, pit, offR, offF, offU, dist);
+                    {
+                        const float qx = px - g_headMtx[12], qy = py - g_headMtx[13], qz = pz - g_headMtx[14];
+                        Log("      pivot-from-head R/F/U=(%.3f,%.3f,%.3f) localOfs@+0x1C0=(%.3f,%.3f,%.3f) worldOfs@+0x1B0=(%.3f,%.3f,%.3f)",
+                            qx * m[0] + qy * m[1] + qz * m[2], qx * m[4] + qy * m[5] + qz * m[6], qx * m[8] + qy * m[9] + qz * m[10],
+                            *(float*)(o + 0x1C0), *(float*)(o + 0x1C4), *(float*)(o + 0x1C8),
+                            *(float*)(o + 0x1B0), *(float*)(o + 0x1B4), *(float*)(o + 0x1B8));
+                    }
+                    const float D2R = 0.01745329f;
+                    struct Want { const char* n; float v; };
+                    const Want want[] = {
+                        { "yaw", yaw }, { "-yaw", -yaw }, { "yaw+pi", yaw + 3.14159265f }, { "yawDeg", yaw / D2R },
+                        { "pitch", pit }, { "-pitch", -pit }, { "pitchDeg", pit / D2R },
+                        { "offR", offR }, { "-offR", -offR }, { "offF", offF }, { "-offF", -offF },
+                        { "offU", offU }, { "-offU", -offU }, { "dist", dist }
+                    };
+                    for (int off = 0x60; off + 4 <= lim; off += 4)
+                    {
+                        const float v = *(float*)(o + off);
+                        for (int w = 0; w < 14; ++w)
+                            if (fabsf(want[w].v) > 0.05f && fabsf(v - want[w].v) < 0.0025f * fmaxf(1.f, fabsf(want[w].v)))
+                                Log("        +0x%03X = %.4f  ~ %s (%.4f)", off, v, want[w].n, want[w].v);
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("    cam pool dump faulted"); }
+}
+
 static DWORD WINAPI Worker(LPVOID)
 {
     Log("Worker started");
-    const int N = 18;
+    const int N = 22;
     bool k[N] = { 0 };
     const int vk[N] = { VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
                         VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_F6,
                         '7' /* cs slot - */, '8' /* cs slot + */, 'B' /* head-bone rotation */,
                         'J' /* hide head */,
                         VK_NEXT /* PgDn: FOV - */, VK_PRIOR /* PgUp: FOV + */,
-                        '0' /* un-pin -- hand control back to auto (Niko when available) */ };
+                        '0' /* un-pin -- hand control back to auto (Niko when available) */,
+                        'K' /* aim align on/off */, 'L' /* aim parallax on/off */,
+                        'M' /* aim side: center / game / left */, 'N' /* aim vertical on/off */ };
     int dn = 0; uint32_t tick = 0;
+    bool lmbPrev = false;
     for (;;)
     {
         bool d[N];
         for (int i = 0; i < N; ++i) d[i] = (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
         const int vi = g_inTrain ? 2 : (g_inCar ? 1 : 0);   // which tuning set the keys edit
         const char* ctx = vi == 2 ? "train" : (vi == 1 ? "car" : "foot");
+
+        // debug mode: log the aim state on every fire-button press
+        const bool lmbNow = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (g_debugMode && lmbNow && !lmbPrev) DumpAimState("SHOT");
+        lmbPrev = lmbNow;
 
         // F7 is the only key that works without debug mode. Ctrl+F7 is the
         // hidden switch for debug mode itself -- everything below only fires
@@ -1424,6 +1697,10 @@ static DWORD WINAPI Worker(LPVOID)
             Log("B boneRot=%d (look reset)", g_boneRot);
         }
         if (d[14] && !k[14]) { g_hideHead = !g_hideHead; Log("J hideHead=%d", g_hideHead); }
+        if (d[18] && !k[18]) { g_aimAlign = !g_aimAlign; Log("K aimAlign=%d", g_aimAlign); }
+        if (d[19] && !k[19]) { g_aimParallax = !g_aimParallax; Log("L aimParallax=%d", g_aimParallax); }
+        if (d[20] && !k[20]) { g_aimSide = (g_aimSide + 1) % 3; Log("M aimSide=%d (0 center, 1 game/right, 2 left)", g_aimSide); }
+        if (d[21] && !k[21]) { g_aimVert = !g_aimVert; Log("N aimVert=%d", g_aimVert); }
         if (d[15] && !k[15]) { g_fovBoostV[vi] -= 3.0f; if (g_fovBoostV[vi] < -20.0f) g_fovBoostV[vi] = -20.0f; Log("PgDn fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
         if (d[16] && !k[16]) { g_fovBoostV[vi] += 3.0f; if (g_fovBoostV[vi] > 50.0f) g_fovBoostV[vi] = 50.0f; Log("PgUp fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
         if (g_mode == 3)
@@ -1437,8 +1714,11 @@ static DWORD WINAPI Worker(LPVOID)
             }
             else
             {
-                if (d[6] && !k[6]) { g_eyeFwdV[vi] -= 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); }
-                if (d[7] && !k[7]) { g_eyeFwdV[vi] += 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); }
+                // while aiming (or with Ctrl held) these tune the CURRENT WEAPON's aim eye-forward
+                // (long guns clipping the screen); otherwise the normal eye-forward of the context
+                const bool wpn = g_aimActive || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+                if (d[6] && !k[6]) { if (wpn) AdjustAimFwd(-0.02f); else { g_eyeFwdV[vi] -= 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
+                if (d[7] && !k[7]) { if (wpn) AdjustAimFwd(+0.02f); else { g_eyeFwdV[vi] += 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
             }
         }
         else
@@ -1476,6 +1756,7 @@ static DWORD WINAPI Worker(LPVOID)
             Log("  pedMtx r0=(%.2f,%.2f,%.2f) r1=(%.2f,%.2f,%.2f) r2=(%.2f,%.2f,%.2f)",
                 g_pedMtx3[0], g_pedMtx3[1], g_pedMtx3[2], g_pedMtx3[4], g_pedMtx3[5], g_pedMtx3[6],
                 g_pedMtx3[8], g_pedMtx3[9], g_pedMtx3[10]);
+            DumpAimState("F8");
             __try {
                 Pool cp; if (ReadPool(g_pCamPoolPtr, cp, 0x100))
                 {
