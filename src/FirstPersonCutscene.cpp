@@ -53,7 +53,7 @@
 // actually pushed to GitHub; everything after it is unpublished local WIP until
 // the next real tag. Bump the alphaN suffix each time a new build gets handed
 // over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.4.0-beta"
+#define FPMOD_VERSION "0.4.1-alpha2"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
@@ -107,6 +107,13 @@ static volatile float g_aimFwdW[128] = { 0 };  // per-weapon extra eye-forward w
 // 8 cm is what stops the stock clipping the screen (other slots untuned = 0).
 static volatile float g_aimFwdSlot[16] = { 0, 0, 0, 0, 0, -0.08f };
 static const uintptr_t kAimCamVtblRva = 0xA9B98C;   // CCamAimWeapon vtable, 1.2.0.59 (found via the aim-cam pool dump)
+// The vehicle chase camera: a third-person orbit cam ~5 m out and ~2.5 m up that exists whenever the player is in
+// a car (slot 17/18 in the 2026-09-20 in-car dump; no separate aim camera appears when RMB is held). The drive-by
+// arm points along ITS ray, which is why shots go wherever it looks instead of at the crosshair. The F8 analyzer
+// found its yaw at +0x194 / +0x1AC and pitch at +0x190 / +0x1A8 (same convention as the frame: yaw = atan2(-fx, fy)).
+static const uintptr_t kCarCamVtblRva = 0xA9AF3C;
+static volatile float g_fpYaw = 0.f, g_fpPitch = 0.f;   // yaw / pitch of the view we render, refreshed every camera hook call
+static volatile int   g_fpViewOK = 0;
 
 // native-fed state (polled on the worker thread, read by the camera hook)
 static volatile int   g_natOK = 0;
@@ -471,6 +478,48 @@ static void ApplyAimCamOffset()
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// Drive-by aim. From a car the game points the arm along its vehicle chase camera (see kCarCamVtblRva),
+// which is mouse-driven at the game's own sensitivity and has no idea where our first-person crosshair is,
+// so the two drift apart (log: crosshair front-right, chase cam front-left, arm went left). While the
+// player is firing or aiming from a car, write our view's yaw / pitch into that camera every tick so its
+// ray points where the crosshair does. Sim thread, same spot as ApplyAimCamOffset. Direction only for now:
+// the camera still sits ~5 m out, so very close targets may be off by parallax -- the F8 dump lists the
+// distance candidates for the next step.
+static void ApplyCarAimCam()
+{
+    static bool s_was = false;
+    static int  s_tick = 0;
+    static float s_lastYaw = 0.f;
+    const bool fire = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
+    if (!g_enabled || !g_aimAlign || !g_inCar || g_inTrain || g_isRagdoll || !g_fpViewOK || !fire)
+    {
+        s_was = false;
+        return;
+    }
+    Pool cp;
+    if (!ReadPool(g_pCamPoolPtr, cp, 0x100) || cp.stride < 0x1B0) return;
+    const uintptr_t want = g_moduleBase + kCarCamVtblRva;
+    __try {
+        for (int i = 0; i < cp.size; ++i)
+        {
+            if (cp.flags[i] & 0x80) continue;
+            uint8_t* o = cp.storage + (size_t)i * cp.stride;
+            if (*(uintptr_t*)o != want) continue;
+            float* pitch1 = (float*)(o + 0x190); float* yaw1 = (float*)(o + 0x194);
+            float* pitch2 = (float*)(o + 0x1A8); float* yaw2 = (float*)(o + 0x1AC);
+            const float y = g_fpYaw, p = g_fpPitch;
+            if (g_debugMode && (!s_was || (++s_tick % 60) == 0))
+                Log("carAim steer: cam yaw %.3f pitch %.3f (drift since our last write %.3f rad) -> ours yaw %.3f pitch %.3f",
+                    *yaw1, *pitch1, WrapPi(*yaw1 - s_lastYaw), y, p);
+            *pitch1 = p; *yaw1 = y; *pitch2 = p; *yaw2 = y;
+            s_lastYaw = y;
+            s_was = true;
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 // Extra eye-forward while aiming for the current weapon. A long gun's stock ends up
 // beside/behind the eye and pokes into view (clips at the screen edge); pushing the eye
 // forward puts the stock behind the camera plane. Per-weapon value first, then the value
@@ -752,6 +801,9 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         dst[0] = R[0]; dst[1] = R[1]; dst[2] = R[2];
         dst[4] = F[0]; dst[5] = F[1]; dst[6] = F[2];
         dst[8] = U[0]; dst[9] = U[1]; dst[10] = U[2];
+        g_fpYaw = atan2f(-F[0], F[1]);
+        g_fpPitch = asinf(fmaxf(-1.f, fminf(1.f, F[2])));
+        g_fpViewOK = 1;
 
         // nudge toward eyes/mouth: forward a touch along the view direction
         dst[12] = hx + F[0] * g_eyeFwdV[vi];
@@ -839,6 +891,7 @@ static void OnGameFrame()
     g_gameThreadId = GetCurrentThreadId();
     if (g_useNatives) PollNatives();
     ApplyAimCamOffset();
+    ApplyCarAimCam();
 }
 
 __declspec(naked) void FrameStub()
@@ -1897,6 +1950,15 @@ static void SaveKeyAction(bool ctrl)
     else      Toast(SaveIni() ? "First person: settings saved to the .ini" : "First person: could not write the .ini");
 }
 
+// Camera-pool vtables already understood (RVAs, 1.2.0.59): the two final-frame mirrors (slots
+// 0/12 and 1) and the on-foot follow cam. F8 runs the aim-cam analyzer on every OTHER live camera
+// object too, so a camera we haven't met yet (the drive-by one) shows its yaw/pitch fields in one log.
+static bool IsKnownCamVtbl(uintptr_t vt)
+{
+    const uintptr_t rva = vt - g_moduleBase;
+    return rva == 0xAC8FA0 || rva == 0xAAA588 || rva == 0xA9B4A8;
+}
+
 // Aim-accuracy diagnostics. The game aims from its own camera objects
 // (CCamAimWeapon etc. -- each has its own frame at +0x10 and pitch/heading
 // fields), not from the final camera matrix we overwrite, so shots can diverge
@@ -1905,9 +1967,9 @@ static void DumpAimState(const char* tag)
 {
     const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    Log("  aim[%s] rmb=%d lmb=%d charHdg=%.1fdeg seedYaw=%.2f lookYaw=%.2f lookPitch=%.2f inCs=%d ragdoll=%d align=%d parallax=%d side=%d vert=%d weapon=%d slot=%d aimFwd=%.2f",
+    Log("  aim[%s] rmb=%d lmb=%d charHdg=%.1fdeg seedYaw=%.2f lookYaw=%.2f lookPitch=%.2f inCs=%d ragdoll=%d inCar=%d align=%d parallax=%d side=%d vert=%d weapon=%d slot=%d aimFwd=%.2f",
         tag, (int)rmb, (int)lmb, g_charHeading, g_seedYaw, g_lookYaw, g_lookPitch,
-        (int)(g_cutsceneName && g_cutsceneName[0]), g_isRagdoll, g_aimAlign, g_aimParallax, g_aimSide, g_aimVert,
+        (int)(g_cutsceneName && g_cutsceneName[0]), g_isRagdoll, g_inCar, g_aimAlign, g_aimParallax, g_aimSide, g_aimVert,
         g_curWeapon, g_curWeaponSlot, EffectiveAimFwd());
     __try {
         Pool cp;
@@ -1921,22 +1983,37 @@ static void DumpAimState(const char* tag)
                 const float* m = (const float*)(o + 0x10);
                 float f144 = 0, f148 = 0;
                 if (cp.stride >= 0x150) { f144 = *(float*)(o + 0x144); f148 = *(float*)(o + 0x148); }
+                // a camera sitting on its default +Y / +Z frame isn't doing anything: keep it out of the shot dumps
+                const bool idle = (fabsf(m[4]) < 1e-3f && fabsf(m[6]) < 1e-3f) || (fabsf(m[4]) < 1e-3f && fabsf(m[5]) < 1e-3f);
+                if (idle && tag[0] != 'F') continue;
                 Log("    cam[%2d] vt=+0x%X fwd=(%.2f,%.2f,%.2f) pos=(%.1f,%.1f,%.1f) fov=%.1f f144=%.3f f148=%.3f",
                     i, (unsigned)(vt - g_moduleBase), m[4], m[5], m[6], m[12], m[13], m[14], m[20], f144, f148);
+                const bool isAimCam = (vt == g_moduleBase + kAimCamVtblRva);
+                const bool isCarCam = (vt == g_moduleBase + kCarCamVtblRva);
                 // F8 only: raw floats of the aim camera, to locate its own yaw/pitch fields
-                if (tag[0] == 'F' && vt == g_moduleBase + kAimCamVtblRva && cp.stride >= 0x1D0)
+                if (tag[0] == 'F' && isAimCam && cp.stride >= 0x1D0)
                     for (int r = 0x110; r < 0x1D0; r += 0x20)
                     {
                         const float* q = (const float*)(o + r);
                         Log("      +0x%03X: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f", r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
                     }
-                // F8 only: work out the aim cam's shoulder offset (camera-space R/F/U from its
-                // pivot at +0x140) and its yaw/pitch, then flag every float in the object
-                // that equals one of them -- points straight at the fields we'd need to zero.
-                if (tag[0] == 'F' && vt == g_moduleBase + kAimCamVtblRva)
+                // ...and of the vehicle chase camera (the drive-by one): its orbit distance / target live in here
+                if (tag[0] == 'F' && isCarCam && cp.stride >= 0x260)
+                    for (int r = 0x60; r < 0x260; r += 0x20)
+                    {
+                        const float* q = (const float*)(o + r);
+                        Log("      +0x%03X: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f", r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+                    }
+                // F8 only: work out the camera's offset (camera-space R/F/U) from its pivot -- for the
+                // aim cam the pivot sits at +0x140, for any other live camera we use the player's head --
+                // plus its yaw/pitch, then flag every float in the object that equals one of them. Points
+                // straight at the fields we'd need to change (shoulder offset, orbit distance, angles).
+                if (tag[0] == 'F' && (isAimCam || (!idle && !IsKnownCamVtbl(vt))))
                 {
                     const int lim = cp.stride < 0x400 ? cp.stride : 0x400;
-                    const float px = *(float*)(o + 0x140), py = *(float*)(o + 0x144), pz = *(float*)(o + 0x148);
+                    const float px = isAimCam ? *(float*)(o + 0x140) : g_headMtx[12];
+                    const float py = isAimCam ? *(float*)(o + 0x144) : g_headMtx[13];
+                    const float pz = isAimCam ? *(float*)(o + 0x148) : g_headMtx[14];
                     const float dx = m[12] - px, dy = m[13] - py, dz = m[14] - pz;
                     const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
                     const float yaw = atan2f(-m[4], m[5]);
@@ -1944,8 +2021,9 @@ static void DumpAimState(const char* tag)
                     const float offR = dx * m[0] + dy * m[1] + dz * m[2];
                     const float offF = dx * m[4] + dy * m[5] + dz * m[6];
                     const float offU = dx * m[8] + dy * m[9] + dz * m[10];
-                    Log("      aimcam stride=0x%X pivot=(%.2f,%.2f,%.2f) yaw=%.4f pitch=%.4f offset R/F/U=(%.3f,%.3f,%.3f) dist=%.3f",
-                        (unsigned)cp.stride, px, py, pz, yaw, pit, offR, offF, offU, dist);
+                    Log("      %s stride=0x%X pivot=(%.2f,%.2f,%.2f) yaw=%.4f pitch=%.4f offset R/F/U=(%.3f,%.3f,%.3f) dist=%.3f",
+                        isAimCam ? "aimcam" : "camera(pivot=head)", (unsigned)cp.stride, px, py, pz, yaw, pit, offR, offF, offU, dist);
+                    if (isAimCam)
                     {
                         const float qx = px - g_headMtx[12], qy = py - g_headMtx[13], qz = pz - g_headMtx[14];
                         Log("      pivot-from-head R/F/U=(%.3f,%.3f,%.3f) localOfs@+0x1C0=(%.3f,%.3f,%.3f) worldOfs@+0x1B0=(%.3f,%.3f,%.3f)",
@@ -1961,13 +2039,25 @@ static void DumpAimState(const char* tag)
                         { "offR", offR }, { "-offR", -offR }, { "offF", offF }, { "-offF", -offF },
                         { "offU", offU }, { "-offU", -offU }, { "dist", dist }
                     };
-                    for (int off = 0x60; off + 4 <= lim; off += 4)
+                    int shown = 0;      // uninitialised memory can match by accident -- cap the spam
+                    for (int off = 0x60; off + 4 <= lim && shown < 60; off += 4)
                     {
                         const float v = *(float*)(o + off);
                         for (int w = 0; w < 14; ++w)
                             if (fabsf(want[w].v) > 0.05f && fabsf(v - want[w].v) < 0.0025f * fmaxf(1.f, fabsf(want[w].v)))
+                            {
                                 Log("        +0x%03X = %.4f  ~ %s (%.4f)", off, v, want[w].n, want[w].v);
+                                ++shown;
+                            }
                     }
+                    // a vec3 that sits near the player = the camera's target / pivot position
+                    if (!isAimCam)
+                        for (int off = 0x60; off + 12 <= lim; off += 4)
+                        {
+                            const float* q = (const float*)(o + off);
+                            if (fabsf(q[0] - g_headMtx[12]) < 3.f && fabsf(q[1] - g_headMtx[13]) < 3.f && fabsf(q[2] - g_headMtx[14]) < 4.f)
+                                Log("        +0x%03X = (%.2f,%.2f,%.2f)  ~ near the player (target / pivot?)", off, q[0], q[1], q[2]);
+                        }
                 }
             }
         }

@@ -123,6 +123,12 @@ render, so shots used to miss the crosshair. On foot, while that camera is live 
   instead of the right shoulder (side selectable with **M**), and
 - slides the eye onto that ray, so the crosshair is the bullet line.
 
+From a car (drive-bys) the game points the arm along its vehicle chase camera instead: a
+third-person orbit camera about 5 m out that is driven by the mouse at the game's own
+sensitivity, so it drifts away from your first-person view. While you hold LMB or RMB in a car,
+the mod writes your view's yaw / pitch into that camera every tick, so the arm follows the
+crosshair. **K** switches this off together with the on-foot alignment.
+
 The current weapon is read with `GET_CURRENT_CHAR_WEAPON` + `GET_WEAPONTYPE_SLOT`. Each weapon
 slot (category) has an eye-forward offset applied while aiming, so long guns' stocks don't clip
 the screen; assault rifles (M4, AK47...) default to −8 cm.
@@ -130,7 +136,6 @@ the screen; assault rifles (M4, AK47...) default to −8 cm.
 ## Known issues
 - Wrong actor is chosen during cutscenes sometimes. You can fix this by enabling debug mode with CTRL + F7 and then cycling peds with 7 and 8.
 - Larger weapons might clip on the screen a bit when shooting in first person mode. Assault rifles are compensated by default; for other weapons, in debug mode aim with the weapon and tap ← / → until the clipping stops (the log prints the weapon, slot and value).
-- Drive-bys still use the game's own aim, so it is off completely.
 - The head casts no shadow, since it is hidden by not drawing it.
 
 ## Contributing 
