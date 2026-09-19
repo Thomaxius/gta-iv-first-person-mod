@@ -24,23 +24,20 @@
 //     drag the view. In a vehicle the base yaw tracks the vehicle heading.
 //   * Head: hidden via SET_DRAW_PLAYER_COMPONENT (HEAD/TEEF/FACE, + HAIR).
 //
-// Mode 3 is first person, and it's the only mode end users get: pressing F7
-// jumps straight into it. Modes 0-2 are old cutscene-only experiments (canary /
-// frozen cam / push-in) kept for reference, reachable only in debug mode.
+// Shipped surface: F7 -- toggle first person on/off, F5 -- save the current settings.
 //
-// Shipped surface: F7 -- toggle first person on/off. That's it.
-//
-// Everything else (mode cycling, eye height/forward/FOV tuning, cutscene actor
-// slot, head-bone rotation test, native invoker toggle, diagnostics dump) is
-// gated behind a hidden debug mode, off by default, toggled with Ctrl+F7.
-// The tuning keys are still in the binary because we're not done tuning --
-// they'll move to an .ini once that's built, at which point debug mode goes
-// away and the tunables become user-configurable instead of hidden.
-//   F8 diagnostics dump   F9 recenter view   F10 cycle mode
+// Settings live in FirstPersonCutscene.ini next to the .asi (created with the
+// defaults on first run; see the "settings (.ini)" section below). Everything
+// else (live eye height/forward/FOV tuning, cutscene actor slot, head-bone
+// rotation test, native invoker toggle, diagnostics dump) is gated behind a
+// debug mode, off by default, toggled with Ctrl+F7.
+//   F8 diagnostics dump   F9 recenter view
 //   F11/F12 eye height -/+   Left/Right eye forward   PgUp/PgDn FOV
 //   B head-bone rotation test   J force head-hide off   7/8 cutscene actor slot
-//   F6 native invoker on/off
-// Eye height / forward / FOV are stored per context (on foot vs in a vehicle).
+//   F6 native invoker on/off   K/L/M/N aim options
+//   F5 (SaveKey; works outside debug mode too) save the current settings into the
+//   .ini, with an on-screen confirmation   Ctrl+F5 reload the .ini
+// Eye height / forward / FOV are stored per context (on foot / car / train).
 //
 // Build: x86 DLL, /MT, no PCH, output extension .asi, next to GTAIV.exe.
 // ---------------------------------------------------------------------------
@@ -49,22 +46,22 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 
 // Local build label, separate from the git tag. v0.2.0-beta is the last version
 // actually pushed to GitHub; everything after it is unpublished local WIP until
 // the next real tag. Bump the alphaN suffix each time a new build gets handed
 // over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.3.1-alpha6"
+#define FPMOD_VERSION "0.4.0-beta"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
 static uintptr_t g_hookReturn = 0;
 
 static volatile uint8_t  g_enabled = 0;
-static volatile int      g_mode = 3;        // 0 canary, 1 frozen, 2 push, 3 player-FP (the only one shipped)
-static volatile int      g_debugMode = 0;   // hidden, off by default -- Ctrl+F7 toggles it. Unlocks every
-                                             // key below except F7 itself. Goes away once the .ini lands.
+static volatile int      g_debugMode = 0;   // off by default -- Ctrl+F7 toggles it (or DebugMode in the .ini).
+                                             // Unlocks every live-tuning key except the on/off key itself.
 static volatile float    g_eyeUp = 0.60f;
 static volatile int      g_useNatives = 1;   // on by default now (F6 still toggles for debug)
 // per-context tuning: [0] = on foot, [1] = in a car, [2] = on a train/subway
@@ -74,6 +71,13 @@ static volatile float    g_eyeFwdV[3] = { 0.20f, 0.05f, 0.05f };    // forward n
 static volatile float    g_eyeTrimV[3] = { 0.17f, 0.09f, 0.33f };   // up/down nudge (F11/F12)
 static volatile float    g_fovBoostV[3] = { 21.0f, 30.0f, 18.0f };   // extra FOV degrees (PgUp/PgDn)
 static volatile float    g_mouseSens = 0.0016f;
+static volatile int      g_invertY = 0;         // .ini InvertY
+static volatile float    g_maxPitch = 1.30f;    // look up/down limit, radians (~74.5 deg); .ini MaxPitchDegrees
+static volatile int      g_toggleVk = VK_F7;    // first-person on/off key; .ini ToggleKey (Ctrl + it = debug mode)
+static volatile int      g_saveVk = VK_F5;      // saves the current settings to the .ini (Ctrl + it reloads); 0 = disabled
+static volatile int      g_showMsgs = 1;        // .ini ShowMessages: short on-screen text when settings are saved / reloaded
+static char              g_toastText[128] = { 0 };
+static volatile int      g_toastReq = 0;        // set by any thread, shown by the next sim-thread poll (natives are sim-thread only)
 static uint32_t* g_frameCount = nullptr;
 static uintptr_t         g_frameInsn = 0;      // the "inc [frameCount]" instruction, hook site
 static uintptr_t         g_frameReturn = 0;
@@ -132,22 +136,20 @@ static volatile int      g_flipFwd = 0;
 static volatile float    g_yawTrim = 0.0f;
 static volatile float    g_pitchTrim = 0.0f;
 static float             g_pedMtx[16] = { 0 };
-static volatile float    g_pushDist = 1.50f;   // mode 2: how far to shove the cam forward
 static volatile int      g_fwdRow = 1;        // which camera row is "forward" (0/1/2)
 static volatile int      g_fwdSign = 0;        // 0 = +row, 1 = -row
 static float             g_dstRot[9] = { 0 };    // last seen shot-cam rotation rows
-static volatile float    g_lookYaw = 0.0f;     // mode 3 free-look, radians
+static volatile float    g_lookYaw = 0.0f;     // free-look, radians
 static volatile float    g_lookPitch = 0.0f;
 static volatile float    g_seedYaw = 0.0f;     // gameplay FP: absolute world yaw the view is built from
 static volatile int      g_seedYawSet = 0;     // 0 = reseed on the next frame
 static float             g_pedMtx3[16] = { 0 };
 
-static float   g_savedCam[16];
-static volatile bool g_haveSaved = false;
 static volatile float g_pickX = 0, g_pickY = 0, g_pickZ = 0, g_pickD2 = -1;
 
 static HINSTANCE g_selfInst = nullptr;
 static char      g_logPath[MAX_PATH] = { 0 };
+static char      g_iniPath[MAX_PATH] = { 0 };
 static uint8_t** g_pCamPoolPtr = nullptr;
 static uint8_t** g_pPedPoolPtr = nullptr;
 static const char* g_cutsceneName = nullptr;
@@ -162,6 +164,13 @@ static void BuildLogPath()
     GetModuleFileNameA(g_selfInst, p, MAX_PATH);
     char* d = strrchr(p, '.'); if (d) *d = 0;
     strcat_s(p, MAX_PATH, ".log"); strcpy_s(g_logPath, MAX_PATH, p);
+}
+static void BuildIniPath()
+{
+    char p[MAX_PATH] = { 0 };
+    GetModuleFileNameA(g_selfInst, p, MAX_PATH);
+    char* d = strrchr(p, '.'); if (d) *d = 0;
+    strcat_s(p, MAX_PATH, ".ini"); strcpy_s(g_iniPath, MAX_PATH, p);
 }
 static void Log(const char* fmt, ...)
 {
@@ -442,7 +451,7 @@ static const float* FindAimCamFrame()
 // tick after the game's own update, so the next tick's camera update reads our value.
 static void ApplyAimCamOffset()
 {
-    if (!g_enabled || g_mode != 3 || !g_aimAlign || g_aimSide == 1) return;
+    if (!g_enabled || !g_aimAlign || g_aimSide == 1) return;
     if (g_inCar || g_inTrain || g_isRagdoll || (g_cutsceneName && g_cutsceneName[0])) return;
     Pool cp;
     if (!ReadPool(g_pCamPoolPtr, cp, 0x100) || cp.stride < 0x1D0) return;
@@ -499,326 +508,292 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         g_shotX = dst[12]; g_shotY = dst[13]; g_shotZ = dst[14];   // pre-override cam pos
         for (int i = 0; i < 3; ++i) { g_dstRot[i] = dst[i]; g_dstRot[3 + i] = dst[4 + i]; g_dstRot[6 + i] = dst[8 + i]; }
 
-        // snapshot the live gameplay camera (for mode 1)
-        if (!inCs) { memcpy(g_savedCam, dst, 64); g_haveSaved = true; }
-
         if (!g_enabled) return;
 
-        // ---- mode 3: head-anchored FP (subway/trains AND cutscenes, via natives) ----
-        if (g_mode == 3)
+        // ---- head-anchored FP (gameplay, vehicles, subway AND cutscenes, via natives) ----
+        // pick the anchor: cutscene actor if in a cutscene, else the real head bone
+        float hx, hy, hz;
+        if (inCs && g_csPedOK)
         {
-            // pick the anchor: cutscene actor if in a cutscene, else the real head bone
-            float hx, hy, hz;
-            if (inCs && g_csPedOK)
+            hx = g_csPedW[0]; hy = g_csPedW[1]; hz = g_csPedW[2] + g_eyeUp;   // actor pos + eye
+        }
+        else if (!inCs && (g_inCar || g_inTrain) && g_FindPlayerPed && g_headMtxOK)
+        {
+            // in a vehicle: the cached head-bone pos is a frame stale -> at speed
+            // the camera visibly lags the car. Read the ped matrix fresh this
+            // frame; the seated head sits ~0.55 above the ped matrix origin.
+            void* ped = g_FindPlayerPed(0);
+            float* m = ped ? *(float**)((char*)ped + 0x20) : nullptr;
+            if (m)
             {
-                hx = g_csPedW[0]; hy = g_csPedW[1]; hz = g_csPedW[2] + g_eyeUp;   // actor pos + eye
+                hx = m[12]; hy = m[13]; hz = m[14] + 0.55f;
+                // Exiting a train: IS_CHAR_IN_ANY_TRAIN stays true for a second or
+                // two into the stand-up-and-step-out animation, so this fixed
+                // seated offset keeps getting applied while Niko's real skeleton
+                // is already rising toward standing height -- pins the camera at
+                // waist level while he's visibly stood up (2026-09-15, subway exit
+                // F8 dump: real head bone climbed 0.4+ units above this formula's
+                // output over several samples while inTrain was still 1, then
+                // matched up again once it cleared). While genuinely seated the
+                // real bone reads BELOW this formula every time (tuned to sit a
+                // touch higher on purpose) -- so preferring whichever is higher
+                // only ever kicks in once he's actually standing.
+                //
+                // HEIGHT ONLY, not X/Y: g_headMtx is a frame (or more) stale --
+                // it's only refreshed once per SIM tick, same staleness this whole
+                // branch exists to dodge for the ped root (see the fresh-read
+                // comment above). Taking its X/Y too made the camera visibly lag
+                // and warp sideways off Niko's real position on a fast-moving
+                // train (2026-09-15 follow-up test) -- X/Y must stay on the
+                // fresh-this-frame root read; only Z borrows the cached bone.
+                if (g_headMtx[14] > hz) hz = g_headMtx[14];
             }
-            else if (!inCs && (g_inCar || g_inTrain) && g_FindPlayerPed && g_headMtxOK)
+            else { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
+        }
+        else if (!inCs && g_headMtxOK)
+        {
+            // Same staleness fix as the vehicle branch above: g_headMtx is only
+            // refreshed once per SIM tick (the frame-hook poll), but this runs
+            // once per RENDERED frame. Under a heavier/uneven renderer (RTX Remix
+            // adds real GPU latency and can decouple render pacing from the sim
+            // tick) that gap becomes visible -- the camera trails a frame or more
+            // behind where the head bone actually is right now. GetBoneMatrix is a
+            // plain function pointer, not a script native, so it's exactly as
+            // legal to call from this render-thread hook as FindPlayerPed already
+            // is elsewhere in this function -- read it fresh here instead of
+            // trusting the cached copy.
+            bool freshOK = false;
+            if (g_GetBoneMtx && g_FindPlayerPed)
             {
-                // in a vehicle: the cached head-bone pos is a frame stale -> at speed
-                // the camera visibly lags the car. Read the ped matrix fresh this
-                // frame; the seated head sits ~0.55 above the ped matrix origin.
-                void* ped = g_FindPlayerPed(0);
-                float* m = ped ? *(float**)((char*)ped + 0x20) : nullptr;
-                if (m)
+                void* pd = g_FindPlayerPed(0);
+                if (pd)
                 {
-                    hx = m[12]; hy = m[13]; hz = m[14] + 0.55f;
-                    // Exiting a train: IS_CHAR_IN_ANY_TRAIN stays true for a second or
-                    // two into the stand-up-and-step-out animation, so this fixed
-                    // seated offset keeps getting applied while Niko's real skeleton
-                    // is already rising toward standing height -- pins the camera at
-                    // waist level while he's visibly stood up (2026-09-15, subway exit
-                    // F8 dump: real head bone climbed 0.4+ units above this formula's
-                    // output over several samples while inTrain was still 1, then
-                    // matched up again once it cleared). While genuinely seated the
-                    // real bone reads BELOW this formula every time (tuned to sit a
-                    // touch higher on purpose) -- so preferring whichever is higher
-                    // only ever kicks in once he's actually standing.
-                    //
-                    // HEIGHT ONLY, not X/Y: g_headMtx is a frame (or more) stale --
-                    // it's only refreshed once per SIM tick, same staleness this whole
-                    // branch exists to dodge for the ped root (see the fresh-read
-                    // comment above). Taking its X/Y too made the camera visibly lag
-                    // and warp sideways off Niko's real position on a fast-moving
-                    // train (2026-09-15 follow-up test) -- X/Y must stay on the
-                    // fresh-this-frame root read; only Z borrows the cached bone.
-                    if (g_headMtx[14] > hz) hz = g_headMtx[14];
+                    float m[16];
+                    g_GetBoneMtx(pd, m, 1205);
+                    if (m[12] || m[13] || m[14]) { hx = m[12]; hy = m[13]; hz = m[14]; freshOK = true; }
                 }
-                else { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
             }
-            else if (!inCs && g_headMtxOK)
-            {
-                // Same staleness fix as the vehicle branch above: g_headMtx is only
-                // refreshed once per SIM tick (the frame-hook poll), but this runs
-                // once per RENDERED frame. Under a heavier/uneven renderer (RTX Remix
-                // adds real GPU latency and can decouple render pacing from the sim
-                // tick) that gap becomes visible -- the camera trails a frame or more
-                // behind where the head bone actually is right now. GetBoneMatrix is a
-                // plain function pointer, not a script native, so it's exactly as
-                // legal to call from this render-thread hook as FindPlayerPed already
-                // is elsewhere in this function -- read it fresh here instead of
-                // trusting the cached copy.
-                bool freshOK = false;
-                if (g_GetBoneMtx && g_FindPlayerPed)
-                {
-                    void* pd = g_FindPlayerPed(0);
-                    if (pd)
-                    {
-                        float m[16];
-                        g_GetBoneMtx(pd, m, 1205);
-                        if (m[12] || m[13] || m[14]) { hx = m[12]; hy = m[13]; hz = m[14]; freshOK = true; }
-                    }
-                }
-                if (!freshOK) { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
-            }
-            else if (g_natOK)
-            {
-                hx = g_headW[0]; hy = g_headW[1]; hz = g_headW[2];                // head bone (already at head)
-            }
-            else if (g_FindPlayerPed)
-            {
-                void* ped = g_FindPlayerPed(0);
-                if (!ped) return;
-                float* m = *(float**)((char*)ped + 0x20);
-                if (!m) return;
-                hx = m[12]; hy = m[13]; hz = m[14] + g_eyeUp;
-            }
-            else return;
-            const int vi = g_inTrain ? 2 : (g_inCar ? 1 : 0);                    // 0 foot, 1 car, 2 train
-            hz += g_eyeTrimV[vi];                                                 // F11/F12 fine nudge
+            if (!freshOK) { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
+        }
+        else if (g_natOK)
+        {
+            hx = g_headW[0]; hy = g_headW[1]; hz = g_headW[2];                // head bone (already at head)
+        }
+        else if (g_FindPlayerPed)
+        {
+            void* ped = g_FindPlayerPed(0);
+            if (!ped) return;
+            float* m = *(float**)((char*)ped + 0x20);
+            if (!m) return;
+            hx = m[12]; hy = m[13]; hz = m[14] + g_eyeUp;
+        }
+        else return;
+        const int vi = g_inTrain ? 2 : (g_inCar ? 1 : 0);                    // 0 foot, 1 car, 2 train
+        hz += g_eyeTrimV[vi];                                                 // F11/F12 fine nudge
 
-            // Aim alignment. The game aims from its own aim camera (CCamAimWeapon), not
-            // from the final matrix we overwrite, and that camera's yaw/pitch drift away
-            // from our own mouse integration (measured: 0-10 deg yaw, -8..+3 deg pitch
-            // apart, plus a ~0.4 m shoulder offset) -- so shots miss the crosshair.
-            // While the aim camera is live, take its yaw/pitch, converging from our old
-            // view over ~80 ms so entering aim doesn't snap.
-            static float s_offYaw = 0.f, s_offPitch = 0.f, s_eyeW = 0.f, s_shift[3] = { 0.f, 0.f, 0.f };
-            static bool  s_aimWas = false;
-            static LONGLONG s_aimQpc = 0; static double s_qpcInv = 0.0;
-            const float* aimF = nullptr;
-            if (g_aimAlign && g_seedYawSet && !inCs && !g_inCar && !g_inTrain && !g_isRagdoll && !g_boneRot)
-                aimF = FindAimCamFrame();
-            {
-                if (s_qpcInv == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); s_qpcInv = 1.0 / (double)qf.QuadPart; }
-                LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
-                float dt = s_aimQpc ? (float)((qn.QuadPart - s_aimQpc) * s_qpcInv) : 0.f;
-                s_aimQpc = qn.QuadPart;
-                if (dt < 0.f || dt > 0.25f) dt = 0.f;
-                const float k = expf(-dt / 0.08f);      // dt==0 on repeat calls within a frame -> no-op
-                if (aimF)
-                {
-                    const float aimYaw = atan2f(-aimF[4], aimF[5]);
-                    const float aimPitch = asinf(fmaxf(-1.f, fminf(1.f, aimF[6])));
-                    if (!s_aimWas)
-                    {
-                        s_offYaw = WrapPi(g_seedYaw + g_lookYaw - aimYaw);
-                        s_offPitch = g_lookPitch - aimPitch;
-                        s_aimWas = true;
-                    }
-                    s_offYaw *= k; s_offPitch *= k;
-                    g_lookYaw = WrapPi(aimYaw + s_offYaw - g_seedYaw);
-                    g_lookPitch = fmaxf(-1.40f, fminf(1.40f, aimPitch + s_offPitch));   // game's aim pitch limit is ~1.396
-                    s_eyeW += (1.f - s_eyeW) * (1.f - k);
-                }
-                else { s_aimWas = false; s_eyeW *= k; }
-            }
-
-            g_aimActive = aimF ? 1 : 0;
-
-            // consume mouse ONCE per rendered frame (this hook fires several times/frame).
-            // When GTA IV's idle camera takes over it rolls the shot cam and drives the
-            // mouse-delta globals to animate its drift -- detect that (incoming up.z
-            // gone negative) and freeze look input so the view doesn't get dragged /
-            // flipped. Our own pitch is hard-clamped to +-1.30 rad (74.5 deg), so our
-            // own math can never produce a negative up.z -- 0.60 was too strict and
-            // falsely tripped on ordinary steep look-down (cos(74.5 deg) =~ 0.27).
-            bool camUpright = g_dstRot[8] > -0.20f;
-            uint32_t fc = g_frameCount ? *g_frameCount : (g_hits >> 3);
+        // Aim alignment. The game aims from its own aim camera (CCamAimWeapon), not
+        // from the final matrix we overwrite, and that camera's yaw/pitch drift away
+        // from our own mouse integration (measured: 0-10 deg yaw, -8..+3 deg pitch
+        // apart, plus a ~0.4 m shoulder offset) -- so shots miss the crosshair.
+        // While the aim camera is live, take its yaw/pitch, converging from our old
+        // view over ~80 ms so entering aim doesn't snap.
+        static float s_offYaw = 0.f, s_offPitch = 0.f, s_eyeW = 0.f, s_shift[3] = { 0.f, 0.f, 0.f };
+        static bool  s_aimWas = false;
+        static LONGLONG s_aimQpc = 0; static double s_qpcInv = 0.0;
+        const float* aimF = nullptr;
+        if (g_aimAlign && g_seedYawSet && !inCs && !g_inCar && !g_inTrain && !g_isRagdoll && !g_boneRot)
+            aimF = FindAimCamFrame();
+        {
+            if (s_qpcInv == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); s_qpcInv = 1.0 / (double)qf.QuadPart; }
+            LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+            float dt = s_aimQpc ? (float)((qn.QuadPart - s_aimQpc) * s_qpcInv) : 0.f;
+            s_aimQpc = qn.QuadPart;
+            if (dt < 0.f || dt > 0.25f) dt = 0.f;
+            const float k = expf(-dt / 0.08f);      // dt==0 on repeat calls within a frame -> no-op
             if (aimF)
             {
-                // the aim camera owns yaw/pitch right now -- drain so nothing bursts when it ends
-                g_lastLookFrame = fc;
-                InterlockedExchange(&g_mouseDX, 0);
-                InterlockedExchange(&g_mouseDY, 0);
-            }
-            else if (camUpright && fc != g_lastLookFrame)
-            {
-                g_lastLookFrame = fc;
-                float mdx = 0, mdy = 0;
-                if (g_diMouseX) mdx += (float)*g_diMouseX;
-                if (g_diMouseY) mdy += (float)*g_diMouseY;
-                mdx += (float)InterlockedExchange(&g_mouseDX, 0);
-                mdy += (float)InterlockedExchange(&g_mouseDY, 0);
-                if (mdx > -1.5f && mdx < 1.5f) mdx = 0.0f;   // reject sub-pixel jitter
-                if (mdy > -1.5f && mdy < 1.5f) mdy = 0.0f;
-                if (mdx > 200.0f) mdx = 200.0f; if (mdx < -200.0f) mdx = -200.0f;
-                if (mdy > 200.0f) mdy = 200.0f; if (mdy < -200.0f) mdy = -200.0f;
-                g_lookYaw -= mdx * g_mouseSens;
-                g_lookPitch -= mdy * g_mouseSens;
-                if (g_lookPitch > 1.30f) g_lookPitch = 1.30f;
-                if (g_lookPitch < -1.30f) g_lookPitch = -1.30f;
-            }
-            else if (!camUpright)
-            {
-                // idle cam: drain the mouse deltas so they don't burst when it ends
-                if (g_diMouseX) { volatile int32_t t = *g_diMouseX; (void)t; }
-                InterlockedExchange(&g_mouseDX, 0);
-                InterlockedExchange(&g_mouseDY, 0);
-            }
-
-            dst[12] = hx;
-            dst[13] = hy;
-            dst[14] = hz;
-            g_pickX = hx; g_pickY = hy; g_pickZ = hz;
-
-            // base orientation:
-            //  - g_boneRot (manual) or g_isRagdoll (auto): the head bone's own matrix
-            //    (true head tracking) -- so getting knocked down / ragdolling actually
-            //    tumbles the view instead of it staying locked to one direction.
-            //    g_fwdRow picks which bone axis is "look", g_fwdSign flips it.
-            //  - else g_headingOK: Niko's heading (locks yaw to his facing)
-            //  - else: the incoming shot/gameplay camera direction
-            float R[3], F[3];
-            if ((g_boneRot || g_isRagdoll) && g_headMtxOK && !inCs)
-            {
-                int fr = g_fwdRow & 3; if (fr > 2) fr = 0;
-                int rr = (fr + 1) % 3;
-                F[0] = g_headMtx[fr * 4 + 0]; F[1] = g_headMtx[fr * 4 + 1]; F[2] = g_headMtx[fr * 4 + 2];
-                // the bone matrix's "rr" row is the LEFT vector, not right (its up row
-                // matches R x F only once negated -- confirmed against the bone's own
-                // up row: without this, R x F pointed down and the view was upside down)
-                R[0] = -g_headMtx[rr * 4 + 0]; R[1] = -g_headMtx[rr * 4 + 1]; R[2] = -g_headMtx[rr * 4 + 2];
-            }
-            else if (inCs)
-            {
-                // cutscene: FREE LOOK. an absolute world yaw seeded once from the first
-                // shot's direction, then moved only by the mouse -- so the view PERSISTS
-                // through the director's shot cuts instead of snapping to each new angle.
-                if (!g_seedYawSet)
+                const float aimYaw = atan2f(-aimF[4], aimF[5]);
+                const float aimPitch = asinf(fmaxf(-1.f, fminf(1.f, aimF[6])));
+                if (!s_aimWas)
                 {
-                    g_seedYaw = atan2f(-g_dstRot[3], g_dstRot[4]);
-                    g_seedYawSet = 1;
+                    s_offYaw = WrapPi(g_seedYaw + g_lookYaw - aimYaw);
+                    s_offPitch = g_lookPitch - aimPitch;
+                    s_aimWas = true;
                 }
-                float y = g_seedYaw;
-                F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
-                R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+                s_offYaw *= k; s_offPitch *= k;
+                g_lookYaw = WrapPi(aimYaw + s_offYaw - g_seedYaw);
+                g_lookPitch = fmaxf(-1.40f, fminf(1.40f, aimPitch + s_offPitch));   // game's aim pitch limit is ~1.396
+                s_eyeW += (1.f - s_eyeW) * (1.f - k);
             }
-            else if (g_useNatives && g_headingOK && (g_inCar || g_inTrain))
+            else { s_aimWas = false; s_eyeW *= k; }
+        }
+
+        g_aimActive = aimF ? 1 : 0;
+
+        // consume mouse ONCE per rendered frame (this hook fires several times/frame).
+        // When GTA IV's idle camera takes over it rolls the shot cam and drives the
+        // mouse-delta globals to animate its drift -- detect that (incoming up.z
+        // gone negative) and freeze look input so the view doesn't get dragged /
+        // flipped. Our own pitch is hard-clamped to +-1.30 rad (74.5 deg), so our
+        // own math can never produce a negative up.z -- 0.60 was too strict and
+        // falsely tripped on ordinary steep look-down (cos(74.5 deg) =~ 0.27).
+        bool camUpright = g_dstRot[8] > -0.20f;
+        uint32_t fc = g_frameCount ? *g_frameCount : (g_hits >> 3);
+        if (aimF)
+        {
+            // the aim camera owns yaw/pitch right now -- drain so nothing bursts when it ends
+            g_lastLookFrame = fc;
+            InterlockedExchange(&g_mouseDX, 0);
+            InterlockedExchange(&g_mouseDY, 0);
+        }
+        else if (camUpright && fc != g_lastLookFrame)
+        {
+            g_lastLookFrame = fc;
+            float mdx = 0, mdy = 0;
+            if (g_diMouseX) mdx += (float)*g_diMouseX;
+            if (g_diMouseY) mdy += (float)*g_diMouseY;
+            mdx += (float)InterlockedExchange(&g_mouseDX, 0);
+            mdy += (float)InterlockedExchange(&g_mouseDY, 0);
+            if (mdx > -1.5f && mdx < 1.5f) mdx = 0.0f;   // reject sub-pixel jitter
+            if (mdy > -1.5f && mdy < 1.5f) mdy = 0.0f;
+            if (mdx > 200.0f) mdx = 200.0f; if (mdx < -200.0f) mdx = -200.0f;
+            if (mdy > 200.0f) mdy = 200.0f; if (mdy < -200.0f) mdy = -200.0f;
+            g_lookYaw -= mdx * g_mouseSens;
+            g_lookPitch -= mdy * g_mouseSens * (g_invertY ? -1.0f : 1.0f);
+            if (g_lookPitch > g_maxPitch) g_lookPitch = g_maxPitch;
+            if (g_lookPitch < -g_maxPitch) g_lookPitch = -g_maxPitch;
+        }
+        else if (!camUpright)
+        {
+            // idle cam: drain the mouse deltas so they don't burst when it ends
+            if (g_diMouseX) { volatile int32_t t = *g_diMouseX; (void)t; }
+            InterlockedExchange(&g_mouseDX, 0);
+            InterlockedExchange(&g_mouseDY, 0);
+        }
+
+        dst[12] = hx;
+        dst[13] = hy;
+        dst[14] = hz;
+        g_pickX = hx; g_pickY = hy; g_pickZ = hz;
+
+        // base orientation:
+        //  - g_boneRot (manual) or g_isRagdoll (auto): the head bone's own matrix
+        //    (true head tracking) -- so getting knocked down / ragdolling actually
+        //    tumbles the view instead of it staying locked to one direction.
+        //    g_fwdRow picks which bone axis is "look", g_fwdSign flips it.
+        //  - else g_headingOK: Niko's heading (locks yaw to his facing)
+        //  - else: the incoming shot/gameplay camera direction
+        float R[3], F[3];
+        if ((g_boneRot || g_isRagdoll) && g_headMtxOK && !inCs)
+        {
+            int fr = g_fwdRow & 3; if (fr > 2) fr = 0;
+            int rr = (fr + 1) % 3;
+            F[0] = g_headMtx[fr * 4 + 0]; F[1] = g_headMtx[fr * 4 + 1]; F[2] = g_headMtx[fr * 4 + 2];
+            // the bone matrix's "rr" row is the LEFT vector, not right (its up row
+            // matches R x F only once negated -- confirmed against the bone's own
+            // up row: without this, R x F pointed down and the view was upside down)
+            R[0] = -g_headMtx[rr * 4 + 0]; R[1] = -g_headMtx[rr * 4 + 1]; R[2] = -g_headMtx[rr * 4 + 2];
+        }
+        else if (inCs)
+        {
+            // cutscene: FREE LOOK. an absolute world yaw seeded once from the first
+            // shot's direction, then moved only by the mouse -- so the view PERSISTS
+            // through the director's shot cuts instead of snapping to each new angle.
+            if (!g_seedYawSet)
             {
-                // in a vehicle / train: the view follows the vehicle's heading each
-                // frame (auto-centers through turns); the mouse is a free offset on top.
-                float y = g_charHeading * 0.01745329f;   // deg -> rad
-                F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
-                R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+                g_seedYaw = atan2f(-g_dstRot[3], g_dstRot[4]);
+                g_seedYawSet = 1;
             }
-            else
+            float y = g_seedYaw;
+            F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
+            R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+        }
+        else if (g_useNatives && g_headingOK && (g_inCar || g_inTrain))
+        {
+            // in a vehicle / train: the view follows the vehicle's heading each
+            // frame (auto-centers through turns); the mouse is a free offset on top.
+            float y = g_charHeading * 0.01745329f;   // deg -> rad
+            F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
+            R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+        }
+        else
+        {
+            // on foot: an ABSOLUTE world yaw seeded once, then moved only by the
+            // mouse. Walking / strafing (A,D) turns the character + chase-cam but
+            // must NOT drag the view.
+            if (!g_seedYawSet)
             {
-                // on foot: an ABSOLUTE world yaw seeded once, then moved only by the
-                // mouse. Walking / strafing (A,D) turns the character + chase-cam but
-                // must NOT drag the view.
-                if (!g_seedYawSet)
-                {
-                    if (g_useNatives && g_headingOK) g_seedYaw = g_charHeading * 0.01745329f;
-                    else g_seedYaw = atan2f(-g_dstRot[3], g_dstRot[4]);
-                    g_seedYawSet = 1;
-                }
-                float y = g_seedYaw;
-                F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
-                R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+                if (g_useNatives && g_headingOK) g_seedYaw = g_charHeading * 0.01745329f;
+                else g_seedYaw = atan2f(-g_dstRot[3], g_dstRot[4]);
+                g_seedYawSet = 1;
             }
-            if (g_fwdSign) { R[0] = -R[0]; R[1] = -R[1]; R[2] = -R[2]; F[0] = -F[0]; F[1] = -F[1]; F[2] = -F[2]; }
+            float y = g_seedYaw;
+            F[0] = -sinf(y); F[1] = cosf(y); F[2] = 0.f;
+            R[0] = cosf(y);  R[1] = sinf(y); R[2] = 0.f;
+        }
+        if (g_fwdSign) { R[0] = -R[0]; R[1] = -R[1]; R[2] = -R[2]; F[0] = -F[0]; F[1] = -F[1]; F[2] = -F[2]; }
 
-            float cy = cosf(g_lookYaw), sy = sinf(g_lookYaw);
-            { float x = R[0] * cy - R[1] * sy, y = R[0] * sy + R[1] * cy; R[0] = x; R[1] = y; }
-            { float x = F[0] * cy - F[1] * sy, y = F[0] * sy + F[1] * cy; F[0] = x; F[1] = y; }
+        float cy = cosf(g_lookYaw), sy = sinf(g_lookYaw);
+        { float x = R[0] * cy - R[1] * sy, y = R[0] * sy + R[1] * cy; R[0] = x; R[1] = y; }
+        { float x = F[0] * cy - F[1] * sy, y = F[0] * sy + F[1] * cy; F[0] = x; F[1] = y; }
 
-            if (g_lookPitch != 0.0f)
-            {
-                float cp = cosf(g_lookPitch), sp = sinf(g_lookPitch);
-                float ux = R[1] * F[2] - R[2] * F[1], uy = R[2] * F[0] - R[0] * F[2], uz = R[0] * F[1] - R[1] * F[0];
-                F[0] = F[0] * cp + ux * sp; F[1] = F[1] * cp + uy * sp; F[2] = F[2] * cp + uz * sp;
-            }
+        if (g_lookPitch != 0.0f)
+        {
+            float cp = cosf(g_lookPitch), sp = sinf(g_lookPitch);
+            float ux = R[1] * F[2] - R[2] * F[1], uy = R[2] * F[0] - R[0] * F[2], uz = R[0] * F[1] - R[1] * F[0];
+            F[0] = F[0] * cp + ux * sp; F[1] = F[1] * cp + uy * sp; F[2] = F[2] * cp + uz * sp;
+        }
 
-            float U[3] = { R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0] };
-            float ul = sqrtf(U[0] * U[0] + U[1] * U[1] + U[2] * U[2]); if (ul > 1e-4f) { U[0] /= ul; U[1] /= ul; U[2] /= ul; }
-            R[0] = F[1] * U[2] - F[2] * U[1]; R[1] = F[2] * U[0] - F[0] * U[2]; R[2] = F[0] * U[1] - F[1] * U[0];
-            float rl = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]); if (rl > 1e-4f) { R[0] /= rl; R[1] /= rl; R[2] /= rl; }
+        float U[3] = { R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0] };
+        float ul = sqrtf(U[0] * U[0] + U[1] * U[1] + U[2] * U[2]); if (ul > 1e-4f) { U[0] /= ul; U[1] /= ul; U[2] /= ul; }
+        R[0] = F[1] * U[2] - F[2] * U[1]; R[1] = F[2] * U[0] - F[0] * U[2]; R[2] = F[0] * U[1] - F[1] * U[0];
+        float rl = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]); if (rl > 1e-4f) { R[0] /= rl; R[1] /= rl; R[2] /= rl; }
 
-            dst[0] = R[0]; dst[1] = R[1]; dst[2] = R[2];
-            dst[4] = F[0]; dst[5] = F[1]; dst[6] = F[2];
-            dst[8] = U[0]; dst[9] = U[1]; dst[10] = U[2];
+        dst[0] = R[0]; dst[1] = R[1]; dst[2] = R[2];
+        dst[4] = F[0]; dst[5] = F[1]; dst[6] = F[2];
+        dst[8] = U[0]; dst[9] = U[1]; dst[10] = U[2];
 
-            // nudge toward eyes/mouth: forward a touch along the view direction
-            dst[12] = hx + F[0] * g_eyeFwdV[vi];
-            dst[13] = hy + F[1] * g_eyeFwdV[vi];
-            dst[14] = hz + F[2] * g_eyeFwdV[vi];
+        // nudge toward eyes/mouth: forward a touch along the view direction
+        dst[12] = hx + F[0] * g_eyeFwdV[vi];
+        dst[13] = hy + F[1] * g_eyeFwdV[vi];
+        dst[14] = hz + F[2] * g_eyeFwdV[vi];
+        g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
+
+        // Parallax: slide the eye sideways/vertically onto the aim ray (the component
+        // of the aim camera's offset perpendicular to the view), so the crosshair ray
+        // and the game's aim ray are the same line. Fades in/out with the aim camera.
+        if (aimF && g_aimParallax)
+        {
+            const float dx = aimF[12] - dst[12], dy = aimF[13] - dst[13], dz = aimF[14] - dst[14];
+            const float along = dx * F[0] + dy * F[1] + dz * F[2];
+            const float sx = dx - along * F[0], sy = dy - along * F[1], sz = dz - along * F[2];
+            if (sx * sx + sy * sy + sz * sz < 4.0f) { s_shift[0] = sx; s_shift[1] = sy; s_shift[2] = sz; }
+        }
+        if (g_aimParallax && s_eyeW > 0.001f)
+        {
+            dst[12] += s_shift[0] * s_eyeW; dst[13] += s_shift[1] * s_eyeW; dst[14] += s_shift[2] * s_eyeW;
             g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
+        }
 
-            // Parallax: slide the eye sideways/vertically onto the aim ray (the component
-            // of the aim camera's offset perpendicular to the view), so the crosshair ray
-            // and the game's aim ray are the same line. Fades in/out with the aim camera.
-            if (aimF && g_aimParallax)
+        // Weapon-aware eye-forward while aiming (fades with the aim camera).
+        if (s_eyeW > 0.001f)
+        {
+            const float af = EffectiveAimFwd() * s_eyeW;
+            if (af != 0.f)
             {
-                const float dx = aimF[12] - dst[12], dy = aimF[13] - dst[13], dz = aimF[14] - dst[14];
-                const float along = dx * F[0] + dy * F[1] + dz * F[2];
-                const float sx = dx - along * F[0], sy = dy - along * F[1], sz = dz - along * F[2];
-                if (sx * sx + sy * sy + sz * sz < 4.0f) { s_shift[0] = sx; s_shift[1] = sy; s_shift[2] = sz; }
-            }
-            if (g_aimParallax && s_eyeW > 0.001f)
-            {
-                dst[12] += s_shift[0] * s_eyeW; dst[13] += s_shift[1] * s_eyeW; dst[14] += s_shift[2] * s_eyeW;
+                dst[12] += F[0] * af; dst[13] += F[1] * af; dst[14] += F[2] * af;
                 g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
             }
-
-            // Weapon-aware eye-forward while aiming (fades with the aim camera).
-            if (s_eyeW > 0.001f)
-            {
-                const float af = EffectiveAimFwd() * s_eyeW;
-                if (af != 0.f)
-                {
-                    dst[12] += F[0] * af; dst[13] += F[1] * af; dst[14] += F[2] * af;
-                    g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
-                }
-            }
-
-            // FOV: dst[20] (matrix+0x50) is the field of view, already copied in by
-            // the stolen bytes. widen it a touch.
-            if (g_fovBoostV[vi] != 0.0f)
-            {
-                float f = dst[20] + g_fovBoostV[vi];
-                if (f > 5.0f && f < 140.0f) dst[20] = f;
-            }
-            ++g_applied;
-            return;
         }
 
-        if (!inCs) return;                                                // modes 0/1/2 are cutscene-only
-
-        if (g_mode == 0) { dst[14] = 150.0f; ++g_applied; return; }        // canary
-
-        if (g_mode == 1)                                                   // frozen pre-cutscene cam
+        // FOV: dst[20] (matrix+0x50) is the field of view, already copied in by
+        // the stolen bytes. widen it a touch.
+        if (g_fovBoostV[vi] != 0.0f)
         {
-            if (!g_haveSaved) return;
-            memcpy(dst, g_savedCam, 64);
-            ++g_applied;
-            return;
+            float f = dst[20] + g_fovBoostV[vi];
+            if (f > 5.0f && f < 140.0f) dst[20] = f;
         }
-
-        // g_mode == 2 : push the shot camera forward along its own view axis
-        {
-            int fr = g_fwdRow; if (fr < 0) fr = 0; if (fr > 2) fr = 2;
-            float fx = dst[fr * 4 + 0], fy = dst[fr * 4 + 1], fz = dst[fr * 4 + 2];
-            float fl = sqrtf(fx * fx + fy * fy + fz * fz);
-            if (fl < 1e-4f) return;
-            fx /= fl; fy /= fl; fz /= fl;
-            float s = g_fwdSign ? -1.0f : 1.0f;
-            dst[12] += fx * s * g_pushDist;
-            dst[13] += fy * s * g_pushDist;
-            dst[14] += fz * s * g_pushDist;
-            g_pickX = dst[12]; g_pickY = dst[13]; g_pickZ = dst[14];
-            ++g_applied;
-        }
+        ++g_applied;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -856,7 +831,7 @@ static voidfn_t      g_origGameProcess = nullptr;
 // ---- hide the player's head via SET_DRAW_PLAYER_COMPONENT (proper native) -----
 // components: 0 HEAD, 7 HAIR, 9 TEEF, 10 FACE -- hair always goes with the head,
 // nobody wants it floating in mid-air once the head's gone.
-static volatile int   g_hideHead = 1;   // auto-hides whenever FP (mode 3) is active
+static volatile int   g_hideHead = 1;   // auto-hides whenever first person is on
 
 static void OnGameFrame()
 {
@@ -1124,6 +1099,7 @@ static void PollNativesInner()
     static NativeFn fCharModel = NatFn(0x0A3D60CE);   // GET_CHAR_MODEL(ped,&model)
     static NativeFn fPedModelFromIdx = NatFn(0x124D4571);   // GET_PED_MODEL_FROM_INDEX(idx,&model) -- guess: cutscene slot idx, same space as GET_CUTSCENE_PED_POSITION
 
+    static NativeFn fPrintNow = NatFn(0x0CA539D6);    // PRINT_STRING_WITH_LITERAL_STRING_NOW(gxt,text,ms,flag)
     static NativeFn fCurWeapon = NatFn(0x5AB8289F);   // GET_CURRENT_CHAR_WEAPON(ped,&weapon)
     static NativeFn fWeapSlot = NatFn(0x5E4F6DE3);    // GET_WEAPONTYPE_SLOT(weapon,&slot)
 
@@ -1182,6 +1158,14 @@ static void PollNativesInner()
     }
     if (fInTrain && ped) { NativeCtx a; a.pushI(ped); fInTrain(&a); g_inTrain = a.resI() ? 1 : 0; }
     if (fInCar && ped) { NativeCtx a; a.pushI(ped); fInCar(&a); g_inCar = a.resI() ? 1 : 0; }
+    if (g_toastReq && fPrintNow)
+    {
+        g_toastReq = 0;
+        static char s_toast[128];
+        strncpy_s(s_toast, sizeof(s_toast), g_toastText, _TRUNCATE);
+        NativeCtx a; a.pushP((void*)"STRING"); a.pushP(s_toast); a.pushI(3500); a.pushI(1);
+        fPrintNow(&a);
+    }
     if (fCurWeapon && ped)
     {
         uint32_t w = 0; NativeCtx a; a.pushI(ped); a.pushP(&w); fCurWeapon(&a);
@@ -1213,8 +1197,7 @@ static void PollNativesInner()
     {
         static int   lastState = -1;      // -1 none, 0 shown, 1 hidden
         static uint32_t nextReapply = 0;
-        bool fpActive = g_enabled && g_mode == 3;
-        int want = (fpActive && g_hideHead) ? 1 : 0;
+        int want = (g_enabled && g_hideHead) ? 1 : 0;
         uint32_t now = (uint32_t)g_natTimer;
         if (want != lastState || (want != 0 && now >= nextReapply))
         {
@@ -1564,6 +1547,356 @@ static void PollNatives()
     }
 }
 
+// ---- settings (.ini) ---------------------------------------------------
+// FirstPersonCutscene.ini next to the .asi. Created on first run from the compiled-in
+// defaults (so the file always shows the real defaults); a key that is missing or
+// unparsable just keeps its default. Table-driven: one row per setting drives the load,
+// the F5 save and the default-file writer, so they can't drift apart. Plain Win32
+// profile API, no dependencies.
+// short on-screen text (shown by the next sim-thread poll); no-op if ShowMessages = 0
+static void Toast(const char* text)
+{
+    if (!g_showMsgs) return;
+    strncpy_s(g_toastText, sizeof(g_toastText), text, _TRUNCATE);
+    g_toastReq = 1;
+}
+
+enum IniType { IT_FLOAT, IT_BOOL, IT_SPECIAL };
+enum IniSpecial { SP_NONE, SP_START_ENABLED, SP_TOGGLE_KEY, SP_SAVE_KEY, SP_DEBUG, SP_MAX_PITCH_DEG, SP_AIM_SIDE };
+struct IniEntry
+{
+    const char* sec; const char* key; IniType type;
+    volatile float* pf; volatile int* pi; float lo, hi; int dec;
+    IniSpecial sp;
+    bool reload;      // applied again on Ctrl+F5 (startup-only settings are not)
+    bool save;        // written by F5
+    const char* comment;
+};
+#define INI_F(sec, key, ptr, lo, hi, dec, rl, sv, cmt) { sec, key, IT_FLOAT, ptr, nullptr, lo, hi, dec, SP_NONE, rl, sv, cmt }
+#define INI_B(sec, key, ptr, rl, sv, cmt)              { sec, key, IT_BOOL, nullptr, ptr, 0.f, 1.f, 0, SP_NONE, rl, sv, cmt }
+#define INI_S(sec, key, sp, rl, sv, cmt)               { sec, key, IT_SPECIAL, nullptr, nullptr, 0.f, 0.f, 0, sp, rl, sv, cmt }
+#define INI_SLOT(i, cmt) INI_F("AimEyeForward", "Slot" #i, &g_aimFwdSlot[i], -0.4f, 0.6f, 3, true, true, cmt)
+
+static const IniEntry kIni[] =
+{
+    INI_S("General", "StartEnabled", SP_START_ENABLED, false, false,
+          "1 = first person is already on when the game loads; 0 = press ToggleKey to turn it on."),
+    INI_S("General", "ToggleKey", SP_TOGGLE_KEY, true, false,
+          "Key that turns first person on/off: F1-F12, a letter or digit, or a hex virtual-key code such as 0x76. Ctrl + this key toggles debug mode."),
+    INI_S("General", "SaveKey", SP_SAVE_KEY, true, false,
+          "Key that saves your current in-game settings into this file (Ctrl + it reloads the file). Same key names as ToggleKey, or none to disable. Works with or without debug mode."),
+    INI_B("General", "ShowMessages", &g_showMsgs, true, true,
+          "1 = show a short on-screen message when settings are saved or reloaded."),
+    INI_S("General", "DebugMode", SP_DEBUG, false, false,
+          "1 = debug mode starts on. It unlocks the live-tuning keys (see the README): tune with them in game, then press SaveKey to keep the values."),
+    INI_B("General", "HideHead", &g_hideHead, true, true,
+          "Hide Niko's head and hair so they don't block the view. Turn off only for debugging."),
+    INI_F("General", "MouseSensitivity", &g_mouseSens, 0.0001f, 0.05f, 4, true, true,
+          "Look speed in radians per mouse count. Raise it to look around faster, lower it for slower."),
+    INI_B("General", "InvertY", &g_invertY, true, true,
+          "1 = invert vertical mouse look."),
+    INI_S("General", "MaxPitchDegrees", SP_MAX_PITCH_DEG, true, true,
+          "How far up/down you can look, in degrees (30 - 89)."),
+
+    INI_F("OnFoot", "EyeHeight", &g_eyeTrimV[0], -1.0f, 1.5f, 3, true, true,
+          "Camera height offset in metres, added to the head (on foot) or the seat position (car, train). Positive = higher."),
+    INI_F("OnFoot", "EyeForward", &g_eyeFwdV[0], -0.5f, 1.0f, 3, true, true,
+          "Camera offset forward along the view, in metres. Positive = toward the nose / away from the back of your head."),
+    INI_F("OnFoot", "FovBoost", &g_fovBoostV[0], -20.0f, 50.0f, 1, true, true,
+          "Degrees added to the game's own field of view (negative narrows it). Ultra-wide, very large or very small screens usually want a different value: raise it for a wider view, lower it if the edges look stretched."),
+
+    INI_F("Car", "EyeHeight", &g_eyeTrimV[1], -1.0f, 1.5f, 3, true, true, nullptr),
+    INI_F("Car", "EyeForward", &g_eyeFwdV[1], -0.5f, 1.0f, 3, true, true, nullptr),
+    INI_F("Car", "FovBoost", &g_fovBoostV[1], -20.0f, 50.0f, 1, true, true, nullptr),
+
+    INI_F("Train", "EyeHeight", &g_eyeTrimV[2], -1.0f, 1.5f, 3, true, true, nullptr),
+    INI_F("Train", "EyeForward", &g_eyeFwdV[2], -0.5f, 1.0f, 3, true, true, nullptr),
+    INI_F("Train", "FovBoost", &g_fovBoostV[2], -20.0f, 50.0f, 1, true, true, nullptr),
+
+    INI_B("Aim", "AlignToAimCamera", &g_aimAlign, true, true,
+          "While aiming (hold RMB, on foot) take yaw/pitch from the game's aim camera so shots land on the crosshair. Turning this off brings the missed shots back."),
+    INI_B("Aim", "EyeOnAimRay", &g_aimParallax, true, true,
+          "Also slide the eye onto the game's aim ray so the crosshair is exactly the bullet line."),
+    INI_S("Aim", "AimSide", SP_AIM_SIDE, true, true,
+          "Where the aim ray starts: center = over your head (default), right = the game's own over-the-right-shoulder view, left = over the left shoulder."),
+    INI_B("Aim", "AimRayToEyeHeight", &g_aimVert, true, true,
+          "Experimental: also raise the aim ray to your eye height."),
+
+    INI_SLOT(0, "Extra eye offset while aiming, in metres (+ forward, - back), per weapon slot (category), so long guns' stocks don't clip the screen. Slot5 = assault rifles (M4, AK47...). The log prints \"weapon changed: type=.. slot=..\" for each gun you equip. Add a Weapon<type> = value line to override a single weapon."),
+    INI_SLOT(1, nullptr), INI_SLOT(2, nullptr), INI_SLOT(3, nullptr), INI_SLOT(4, nullptr),
+    INI_SLOT(5, nullptr), INI_SLOT(6, nullptr), INI_SLOT(7, nullptr), INI_SLOT(8, nullptr),
+    INI_SLOT(9, nullptr), INI_SLOT(10, nullptr), INI_SLOT(11, nullptr), INI_SLOT(12, nullptr),
+    INI_SLOT(13, nullptr), INI_SLOT(14, nullptr), INI_SLOT(15, nullptr),
+};
+#undef INI_F
+#undef INI_B
+#undef INI_S
+#undef INI_SLOT
+
+static const char* IniSecNote(const char* sec)
+{
+    if (!strcmp(sec, "General")) return "Basic switches and mouse look.";
+    if (!strcmp(sec, "OnFoot")) return "Camera tuning on foot. OnFoot / Car / Train each have their own eye height, eye forward and FOV boost.";
+    if (!strcmp(sec, "Car")) return "Camera tuning in a car (same keys as [OnFoot]).";
+    if (!strcmp(sec, "Train")) return "Camera tuning on the subway / trains (same keys as [OnFoot]).";
+    if (!strcmp(sec, "Aim")) return "Aiming (hold RMB, on foot): how the camera lines up with where the bullets go.";
+    if (!strcmp(sec, "AimEyeForward")) return "Per-weapon eye offset while aiming.";
+    return nullptr;
+}
+
+// value text of one key, with any inline ; comment and whitespace stripped
+static bool IniRaw(const char* sec, const char* key, char* out, int outSz)
+{
+    static const char kMissing[] = "\x01<missing>";
+    GetPrivateProfileStringA(sec, key, kMissing, out, outSz, g_iniPath);
+    if (strcmp(out, kMissing) == 0) return false;
+    char* c = strchr(out, ';'); if (c) *c = 0;
+    char* s = out; while (*s == ' ' || *s == '\t') ++s;
+    if (s != out) memmove(out, s, strlen(s) + 1);
+    size_t n = strlen(out);
+    while (n && (out[n - 1] == ' ' || out[n - 1] == '\t' || out[n - 1] == '\r')) out[--n] = 0;
+    return out[0] != 0;
+}
+
+// locale-independent (accepts '.' or ',' as the decimal mark)
+static bool ParseFloat(const char* s, float& out)
+{
+    while (*s == ' ' || *s == '\t') ++s;
+    bool neg = false;
+    if (*s == '-') { neg = true; ++s; } else if (*s == '+') ++s;
+    long long mant = 0; int frac = 0, digits = 0; bool dot = false;
+    for (; *s; ++s)
+    {
+        if (*s >= '0' && *s <= '9') { if (digits < 17) { mant = mant * 10 + (*s - '0'); if (dot) ++frac; } ++digits; }
+        else if ((*s == '.' || *s == ',') && !dot) dot = true;
+        else break;
+    }
+    if (digits == 0) return false;
+    double v = (double)mant;
+    for (int i = 0; i < frac; ++i) v /= 10.0;
+    out = (float)(neg ? -v : v);
+    return true;
+}
+
+static int ParseBool(const char* s)   // -1 = not a boolean
+{
+    if (!_stricmp(s, "1") || !_stricmp(s, "true") || !_stricmp(s, "yes") || !_stricmp(s, "on")) return 1;
+    if (!_stricmp(s, "0") || !_stricmp(s, "false") || !_stricmp(s, "no") || !_stricmp(s, "off")) return 0;
+    return -1;
+}
+
+static int VkFromName(const char* s)  // 0 = not recognised
+{
+    if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '1' && s[1] <= '9')
+    {
+        const int n = atoi(s + 1);
+        if (n >= 1 && n <= 24) return VK_F1 + n - 1;
+    }
+    if (s[0] && !s[1])
+    {
+        char c = s[0]; if (c >= 'a' && c <= 'z') c -= 32;
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+    }
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+    {
+        const int v = (int)strtol(s, nullptr, 16);
+        if (v > 0 && v < 256) return v;
+    }
+    return 0;
+}
+
+static void VkName(int vk, char* out, int sz)
+{
+    if (vk >= VK_F1 && vk <= VK_F24) snprintf(out, sz, "F%d", vk - VK_F1 + 1);
+    else if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) snprintf(out, sz, "%c", vk);
+    else snprintf(out, sz, "0x%02X", vk);
+}
+
+static void FmtFloat(char* out, int sz, float v, int dec)
+{
+    snprintf(out, sz, "%.*f", dec, (double)v);
+    for (char* c = out; *c; ++c) if (*c == ',') *c = '.';
+}
+
+static void FormatEntry(const IniEntry& e, char* out, int sz)
+{
+    switch (e.type)
+    {
+    case IT_FLOAT: FmtFloat(out, sz, *e.pf, e.dec); return;
+    case IT_BOOL:  snprintf(out, sz, "%d", *e.pi ? 1 : 0); return;
+    default: break;
+    }
+    switch (e.sp)
+    {
+    case SP_START_ENABLED: snprintf(out, sz, "%d", g_enabled ? 1 : 0); break;
+    case SP_TOGGLE_KEY:    VkName(g_toggleVk, out, sz); break;
+    case SP_SAVE_KEY:      if (g_saveVk) VkName(g_saveVk, out, sz); else snprintf(out, sz, "none"); break;
+    case SP_DEBUG:         snprintf(out, sz, "%d", g_debugMode ? 1 : 0); break;
+    case SP_MAX_PITCH_DEG: FmtFloat(out, sz, g_maxPitch / 0.01745329f, 1); break;
+    case SP_AIM_SIDE:      snprintf(out, sz, "%s", g_aimSide == 2 ? "left" : (g_aimSide == 1 ? "right" : "center")); break;
+    default:               out[0] = 0; break;
+    }
+}
+
+static bool ApplyEntry(const IniEntry& e, const char* raw)
+{
+    float f = 0.f;
+    switch (e.type)
+    {
+    case IT_FLOAT:
+        if (!ParseFloat(raw, f)) return false;
+        if (f < e.lo) f = e.lo;
+        if (f > e.hi) f = e.hi;
+        *e.pf = f;
+        return true;
+    case IT_BOOL:
+    {
+        const int b = ParseBool(raw);
+        if (b < 0) return false;
+        *e.pi = b;
+        return true;
+    }
+    default: break;
+    }
+    switch (e.sp)
+    {
+    case SP_START_ENABLED: { const int b = ParseBool(raw); if (b < 0) return false; g_enabled = (uint8_t)b; return true; }
+    case SP_TOGGLE_KEY:    { const int v = VkFromName(raw); if (!v) return false; g_toggleVk = v; return true; }
+    case SP_SAVE_KEY:
+        if (!_stricmp(raw, "none") || !_stricmp(raw, "off") || !_stricmp(raw, "disabled")) { g_saveVk = 0; return true; }
+        { const int v = VkFromName(raw); if (!v) return false; g_saveVk = v; return true; }
+    case SP_DEBUG:         { const int b = ParseBool(raw); if (b < 0) return false; g_debugMode = b; return true; }
+    case SP_MAX_PITCH_DEG:
+        if (!ParseFloat(raw, f)) return false;
+        if (f < 30.f) f = 30.f;
+        if (f > 89.f) f = 89.f;
+        g_maxPitch = f * 0.01745329f;
+        return true;
+    case SP_AIM_SIDE:
+        if (!_stricmp(raw, "center") || !_stricmp(raw, "centre") || !_stricmp(raw, "middle") || !strcmp(raw, "0")) { g_aimSide = 0; return true; }
+        if (!_stricmp(raw, "right") || !_stricmp(raw, "game") || !_stricmp(raw, "default") || !strcmp(raw, "1")) { g_aimSide = 1; return true; }
+        if (!_stricmp(raw, "left") || !strcmp(raw, "2")) { g_aimSide = 2; return true; }
+        return false;
+    default: return false;
+    }
+}
+
+static void WriteDefaultIni()
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_iniPath, "w") != 0 || !f) { Log("could not create %s", g_iniPath); return; }
+    fprintf(f,
+        "; FirstPersonCutscene.ini -- settings for the GTA IV first-person mod (" FPMOD_VERSION ").\n"
+        "; The values below are the defaults. Delete a line (or this whole file) to get the default back.\n"
+        "; Edit while the game runs, then press Ctrl+SaveKey (Ctrl+F5 by default) to reload.\n"
+        "; In debug mode (Ctrl+ToggleKey) you can also tune live with the keys from the README and press\n"
+        "; SaveKey (F5) to write the current values back into this file. Lines starting with ; are comments.\n");
+    const char* lastSec = "";
+    for (const IniEntry& e : kIni)
+    {
+        if (strcmp(e.sec, lastSec) != 0)
+        {
+            lastSec = e.sec;
+            fprintf(f, "\n[%s]\n", e.sec);
+            const char* note = IniSecNote(e.sec);
+            if (note) fprintf(f, "; %s\n", note);
+        }
+        char v[64]; FormatEntry(e, v, sizeof(v));
+        if (e.comment) fprintf(f, "\n; %s\n", e.comment);
+        fprintf(f, "%s = %s\n", e.key, v);
+    }
+    fclose(f);
+    Log("created default settings file %s", g_iniPath);
+}
+
+// startup = true: apply everything (creating the file with the defaults if it doesn't exist);
+// false (Ctrl+F5): re-apply only the live-tunable rows, leaving the on/off state alone.
+static bool LoadIni(bool startup)
+{
+    if (!g_iniPath[0]) return false;
+    if (GetFileAttributesA(g_iniPath) == INVALID_FILE_ATTRIBUTES)
+    {
+        if (startup) { WriteDefaultIni(); return true; }
+        Log("no .ini to reload (%s)", g_iniPath);
+        return false;
+    }
+    int applied = 0;
+    char raw[96];
+    for (const IniEntry& e : kIni)
+    {
+        if (!startup && !e.reload) continue;
+        if (IniRaw(e.sec, e.key, raw, sizeof(raw)) && ApplyEntry(e, raw)) ++applied;
+    }
+    for (int w = 0; w < 128; ++w)   // per-weapon overrides: Weapon<type> = metres
+    {
+        char key[16]; snprintf(key, sizeof(key), "Weapon%d", w);
+        float v = 0.f;
+        if (IniRaw("AimEyeForward", key, raw, sizeof(raw)) && ParseFloat(raw, v))
+        {
+            if (v < -0.4f) v = -0.4f;
+            if (v > 0.6f) v = 0.6f;
+            g_aimFwdW[w] = v; ++applied;
+        }
+    }
+    char kn[16]; VkName(g_toggleVk, kn, sizeof(kn));
+    Log("settings %s: %d value(s) from %s", startup ? "loaded" : "reloaded", applied, g_iniPath);
+    Log("  toggle=%s enabled=%d debug=%d hideHead=%d sens=%.4f invertY=%d maxPitch=%.1fdeg",
+        kn, (int)g_enabled, (int)g_debugMode, (int)g_hideHead, (double)g_mouseSens, (int)g_invertY,
+        (double)(g_maxPitch / 0.01745329f));
+    Log("  foot[h %.3f f %.3f fov %.1f] car[h %.3f f %.3f fov %.1f] train[h %.3f f %.3f fov %.1f]",
+        (double)g_eyeTrimV[0], (double)g_eyeFwdV[0], (double)g_fovBoostV[0],
+        (double)g_eyeTrimV[1], (double)g_eyeFwdV[1], (double)g_fovBoostV[1],
+        (double)g_eyeTrimV[2], (double)g_eyeFwdV[2], (double)g_fovBoostV[2]);
+    Log("  aim: align=%d eyeOnRay=%d side=%d vert=%d  slot5=%.3f weapon15=%.3f",
+        (int)g_aimAlign, (int)g_aimParallax, (int)g_aimSide, (int)g_aimVert, (double)g_aimFwdSlot[5], (double)g_aimFwdW[15]);
+    return true;
+}
+
+// write one value; for a key that already exists the API keeps the "Key =" text and puts
+// the value straight after it, so lead with a space to keep the file's "Key = value" look
+static bool IniPut(const char* sec, const char* key, const char* val)
+{
+    char raw[32], v[80];   // raw must fit IniRaw's "missing" sentinel, or absent keys look present
+    if (IniRaw(sec, key, raw, sizeof(raw))) snprintf(v, sizeof(v), " %s", val);
+    else snprintf(v, sizeof(v), "%s", val);
+    return WritePrivateProfileStringA(sec, key, v, g_iniPath) != 0;
+}
+
+// F5: write the live tuning back into the .ini (WritePrivateProfileString edits values in
+// place, so the file's comments and any keys we don't touch are preserved).
+static bool SaveIni()
+{
+    if (!g_iniPath[0]) return false;
+    if (GetFileAttributesA(g_iniPath) == INVALID_FILE_ATTRIBUTES) WriteDefaultIni();
+    bool ok = true;
+    char v[64];
+    for (const IniEntry& e : kIni)
+    {
+        if (!e.save) continue;
+        FormatEntry(e, v, sizeof(v));
+        ok = IniPut(e.sec, e.key, v) && ok;
+    }
+    char raw[16];
+    for (int w = 0; w < 128; ++w)
+    {
+        char key[16]; snprintf(key, sizeof(key), "Weapon%d", w);
+        if (g_aimFwdW[w] != 0.f || IniRaw("AimEyeForward", key, raw, sizeof(raw)))
+        {
+            FmtFloat(v, sizeof(v), g_aimFwdW[w], 3);
+            ok = IniPut("AimEyeForward", key, v) && ok;
+        }
+    }
+    Log(ok ? "settings saved to %s" : "settings NOT saved (write failed) to %s", g_iniPath);
+    return ok;
+}
+
+// the save-key action: Ctrl + key reloads the .ini, the key alone saves the current settings
+static void SaveKeyAction(bool ctrl)
+{
+    if (ctrl) Toast(LoadIni(false) ? "First person: settings reloaded" : "First person: no .ini found to reload");
+    else      Toast(SaveIni() ? "First person: settings saved to the .ini" : "First person: could not write the .ini");
+}
+
 // Aim-accuracy diagnostics. The game aims from its own camera objects
 // (CCamAimWeapon etc. -- each has its own frame at +0x10 and pitch/heading
 // fields), not from the final camera matrix we overwrite, so shots can diverge
@@ -1647,20 +1980,23 @@ static DWORD WINAPI Worker(LPVOID)
     Log("Worker started");
     const int N = 22;
     bool k[N] = { 0 };
-    const int vk[N] = { VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+    int vk[N] = { VK_F7 /* replaced each loop by ToggleKey */, VK_F8, VK_F9, VK_F11, VK_F12,
                         VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_F6,
                         '7' /* cs slot - */, '8' /* cs slot + */, 'B' /* head-bone rotation */,
                         'J' /* hide head */,
                         VK_NEXT /* PgDn: FOV - */, VK_PRIOR /* PgUp: FOV + */,
                         '0' /* un-pin -- hand control back to auto (Niko when available) */,
                         'K' /* aim align on/off */, 'L' /* aim parallax on/off */,
-                        'M' /* aim side: center / game / left */, 'N' /* aim vertical on/off */ };
+                        'M' /* aim side: center / game / left */, 'N' /* aim vertical on/off */,
+                        VK_F5 /* save the live tuning to the .ini / Ctrl+F5 reload it */ };
     int dn = 0; uint32_t tick = 0;
     bool lmbPrev = false;
     for (;;)
     {
         bool d[N];
-        for (int i = 0; i < N; ++i) d[i] = (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
+        vk[0] = g_toggleVk;
+        vk[21] = g_saveVk;
+        for (int i = 0; i < N; ++i) d[i] = vk[i] && (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
         const int vi = g_inTrain ? 2 : (g_inCar ? 1 : 0);   // which tuning set the keys edit
         const char* ctx = vi == 2 ? "train" : (vi == 1 ? "car" : "foot");
 
@@ -1669,75 +2005,68 @@ static DWORD WINAPI Worker(LPVOID)
         if (g_debugMode && lmbNow && !lmbPrev) DumpAimState("SHOT");
         lmbPrev = lmbNow;
 
-        // F7 is the only key that works without debug mode. Ctrl+F7 is the
-        // hidden switch for debug mode itself -- everything below only fires
-        // while it's on.
+        // The toggle key (F7 by default, ToggleKey in the .ini) is the only key that works
+        // without debug mode. Ctrl + it switches debug mode itself -- everything below only
+        // fires while that's on.
         if (d[0] && !k[0])
         {
             bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            char kn[16]; VkName(g_toggleVk, kn, sizeof(kn));
             if (ctrl)
             {
                 g_debugMode = !g_debugMode;
-                if (!g_debugMode) { g_mode = 3; g_lookYaw = g_lookPitch = 0; }   // back to the shipped mode
-                Log("Ctrl+F7 debugMode=%d", g_debugMode);
+                Log("Ctrl+%s debugMode=%d", kn, g_debugMode);
             }
             else
             {
                 g_enabled = g_enabled ? 0 : 1; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-                Log("F7 enabled=%d", g_enabled);
+                Log("%s enabled=%d", kn, g_enabled);
             }
         }
 
+        // SaveKey (F5 by default) works with or without debug mode: press it after tuning to
+        // write the current settings into the .ini; Ctrl + it reloads the .ini
+        if (d[21] && !k[21]) SaveKeyAction((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+
         if (g_debugMode)
         {
-        // arrows: mode 3 = look around; other modes = push/fwd tuning
-        if (d[10] && !k[10]) { g_useNatives = !g_useNatives; Log("F6 useNatives=%d", g_useNatives); }
-        if (d[13] && !k[13]) {
+        if (d[9] && !k[9]) { g_useNatives = !g_useNatives; Log("F6 useNatives=%d", g_useNatives); }
+        if (d[12] && !k[12]) {
             g_boneRot = !g_boneRot; g_lookYaw = g_lookPitch = 0;
             Log("B boneRot=%d (look reset)", g_boneRot);
         }
-        if (d[14] && !k[14]) { g_hideHead = !g_hideHead; Log("J hideHead=%d", g_hideHead); }
-        if (d[18] && !k[18]) { g_aimAlign = !g_aimAlign; Log("K aimAlign=%d", g_aimAlign); }
-        if (d[19] && !k[19]) { g_aimParallax = !g_aimParallax; Log("L aimParallax=%d", g_aimParallax); }
-        if (d[20] && !k[20]) { g_aimSide = (g_aimSide + 1) % 3; Log("M aimSide=%d (0 center, 1 game/right, 2 left)", g_aimSide); }
-        if (d[21] && !k[21]) { g_aimVert = !g_aimVert; Log("N aimVert=%d", g_aimVert); }
-        if (d[15] && !k[15]) { g_fovBoostV[vi] -= 3.0f; if (g_fovBoostV[vi] < -20.0f) g_fovBoostV[vi] = -20.0f; Log("PgDn fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
-        if (d[16] && !k[16]) { g_fovBoostV[vi] += 3.0f; if (g_fovBoostV[vi] > 50.0f) g_fovBoostV[vi] = 50.0f; Log("PgUp fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
-        if (g_mode == 3)
+        if (d[13] && !k[13]) { g_hideHead = !g_hideHead; Log("J hideHead=%d", g_hideHead); }
+        if (d[17] && !k[17]) { g_aimAlign = !g_aimAlign; Log("K aimAlign=%d", g_aimAlign); }
+        if (d[18] && !k[18]) { g_aimParallax = !g_aimParallax; Log("L aimParallax=%d", g_aimParallax); }
+        if (d[19] && !k[19]) { g_aimSide = (g_aimSide + 1) % 3; Log("M aimSide=%d (0 center, 1 game/right, 2 left)", g_aimSide); }
+        if (d[20] && !k[20]) { g_aimVert = !g_aimVert; Log("N aimVert=%d", g_aimVert); }
+        if (d[14] && !k[14]) { g_fovBoostV[vi] -= 3.0f; if (g_fovBoostV[vi] < -20.0f) g_fovBoostV[vi] = -20.0f; Log("PgDn fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
+        if (d[15] && !k[15]) { g_fovBoostV[vi] += 3.0f; if (g_fovBoostV[vi] > 50.0f) g_fovBoostV[vi] = 50.0f; Log("PgUp fov[%s]=%.0f", ctx, g_fovBoostV[vi]); }
+        // arrows: up/down = mouse sensitivity, left/right = eye forward
+        if (d[7] && !k[7]) { g_mouseSens *= 1.25f; Log("mouseSens=%.5f", g_mouseSens); }
+        if (d[8] && !k[8]) { g_mouseSens *= 0.80f; Log("mouseSens=%.5f", g_mouseSens); }
+        if (g_boneRot)
         {
-            if (d[8] && !k[8]) { g_mouseSens *= 1.25f; Log("mouseSens=%.5f", g_mouseSens); }
-            if (d[9] && !k[9]) { g_mouseSens *= 0.80f; Log("mouseSens=%.5f", g_mouseSens); }
-            if (g_boneRot)
-            {
-                if (d[6] && !k[6]) { g_fwdRow = (g_fwdRow + 1) % 3; g_lookYaw = g_lookPitch = 0; Log("fwdRow=%d", g_fwdRow); }
-                if (d[7] && !k[7]) { g_fwdSign = !g_fwdSign; g_lookYaw = g_lookPitch = 0; Log("fwdSign=%d", g_fwdSign); }
-            }
-            else
-            {
-                // while aiming (or with Ctrl held) these tune the CURRENT WEAPON's aim eye-forward
-                // (long guns clipping the screen); otherwise the normal eye-forward of the context
-                const bool wpn = g_aimActive || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
-                if (d[6] && !k[6]) { if (wpn) AdjustAimFwd(-0.02f); else { g_eyeFwdV[vi] -= 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
-                if (d[7] && !k[7]) { if (wpn) AdjustAimFwd(+0.02f); else { g_eyeFwdV[vi] += 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
-            }
+            if (d[5] && !k[5]) { g_fwdRow = (g_fwdRow + 1) % 3; g_lookYaw = g_lookPitch = 0; Log("fwdRow=%d", g_fwdRow); }
+            if (d[6] && !k[6]) { g_fwdSign = !g_fwdSign; g_lookYaw = g_lookPitch = 0; Log("fwdSign=%d", g_fwdSign); }
         }
         else
         {
-            if (d[6] && !k[6]) { g_fwdSign = !g_fwdSign; Log("fwdSign=%d", g_fwdSign); }
-            if (d[7] && !k[7]) { g_fwdRow = (g_fwdRow + 1) % 3; Log("fwdRow=%d", g_fwdRow); }
-            if (d[8] && !k[8]) { g_pushDist += 0.25f; Log("pushDist=%.2f", g_pushDist); }
-            if (d[9] && !k[9]) { g_pushDist -= 0.25f; Log("pushDist=%.2f", g_pushDist); }
+            // while aiming (or with Ctrl held) these tune the CURRENT WEAPON's aim eye-forward
+            // (long guns clipping the screen); otherwise the normal eye-forward of the context
+            const bool wpn = g_aimActive || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+            if (d[5] && !k[5]) { if (wpn) AdjustAimFwd(-0.02f); else { g_eyeFwdV[vi] -= 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
+            if (d[6] && !k[6]) { if (wpn) AdjustAimFwd(+0.02f); else { g_eyeFwdV[vi] += 0.03f; Log("eyeFwd[%s]=%.2f", ctx, g_eyeFwdV[vi]); } }
         }
         }   // g_debugMode
 
         if (g_debugMode && d[1] && !k[1])
         {
             ++dn;
-            Log("==== F8 #%d hits=%u applied=%u mode=%d rank=%d eyeUp=%.2f haveSaved=%d cs='%s' ====",
-                dn, g_hits, g_applied, g_mode, g_pedRank, g_eyeUp, (int)g_haveSaved,
+            Log("==== F8 #%d hits=%u applied=%u rank=%d eyeUp=%.2f cs='%s' ====",
+                dn, g_hits, g_applied, g_pedRank, g_eyeUp,
                 (g_cutsceneName && g_cutsceneName[0]) ? g_cutsceneName : "");
             Log("  shotCam pos=(%.1f, %.1f, %.1f)", g_shotX, g_shotY, g_shotZ);
-            Log("  savedCam pos=(%.1f, %.1f, %.1f)", g_savedCam[12], g_savedCam[13], g_savedCam[14]);
             Log("  finalPos=(%.1f, %.1f, %.1f) fwdSign=%d foot[trim %.2f fwd %.2f fov %.0f] car[trim %.2f fwd %.2f fov %.0f] train[trim %.2f fwd %.2f fov %.0f] yaw=%.2f pitch=%.2f",
                 g_pickX, g_pickY, g_pickZ, g_fwdSign,
                 g_eyeTrimV[0], g_eyeFwdV[0], g_fovBoostV[0], g_eyeTrimV[1], g_eyeFwdV[1], g_fovBoostV[1],
@@ -1801,29 +2130,24 @@ static DWORD WINAPI Worker(LPVOID)
         if (d[2] && !k[2]) {
             // F9 = recenter: reseed the view yaw to Niko's current facing, reset look
             g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-            if (g_mode != 3) g_fwdSign = !g_fwdSign;
-            Log("F9 recenter (fwdSign=%d)", g_fwdSign);
+            Log("F9 recenter");
         }
-        if (d[3] && !k[3]) {
-            g_mode = (g_mode + 1) % 4; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-            Log("F10 mode=%d", g_mode);
-        }
-        if (d[4] && !k[4]) { g_eyeTrimV[vi] -= 0.03f; Log("F11 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
-        if (d[5] && !k[5]) { g_eyeTrimV[vi] += 0.03f; Log("F12 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
-        if (d[11] && !k[11]) { g_csUserOverride = 1; g_csIndex = (g_csIndex + CS_SLOTS - 1) % CS_SLOTS; Log("csIndex=%d (7, pinned)", g_csIndex); }
-        if (d[12] && !k[12]) { g_csUserOverride = 1; g_csIndex = (g_csIndex + 1) % CS_SLOTS; Log("csIndex=%d (8, pinned)", g_csIndex); }
+        if (d[3] && !k[3]) { g_eyeTrimV[vi] -= 0.03f; Log("F11 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
+        if (d[4] && !k[4]) { g_eyeTrimV[vi] += 0.03f; Log("F12 eyeTrim[%s]=%.2f", ctx, g_eyeTrimV[vi]); }
+        if (d[10] && !k[10]) { g_csUserOverride = 1; g_csIndex = (g_csIndex + CS_SLOTS - 1) % CS_SLOTS; Log("csIndex=%d (7, pinned)", g_csIndex); }
+        if (d[11] && !k[11]) { g_csUserOverride = 1; g_csIndex = (g_csIndex + 1) % CS_SLOTS; Log("csIndex=%d (8, pinned)", g_csIndex); }
         // 7/8 just step the raw slot index -- no idea which one is Niko. Rather
         // than hunting for him by hand, 0 drops the pin and hands control right
         // back to the auto logic, which snaps onto him immediately if his slot
         // is currently valid (same modelMatch/nikoReady check PollNativesInner
         // already runs every poll -- clearing the override just lets it act).
-        if (d[17] && !k[17]) { g_csUserOverride = 0; Log("0 un-pinned -- back to auto (niko when available)"); }
+        if (d[16] && !k[16]) { g_csUserOverride = 0; Log("0 un-pinned -- back to auto (niko when available)"); }
         }   // g_debugMode
         for (int i = 0; i < N; ++i) k[i] = d[i];
 
         if (++tick % 60 == 0)
-            Log("alive m=%d en=%d nat=%d fhh=%d gtid=%lu timer=%d ped=%d hdg=%.0f(%d) natOK=%d inTrain=%d inCar=%d ragdoll=%d head=(%.1f,%.1f,%.1f) csOK=%d csIdx=%d csPed=(%.1f,%.1f,%.1f) nikoModel=0x%08X modelMatch=%d exc=%d ecode=0x%08X eaddr=0x%p cs='%s'",
-                g_mode, g_enabled, g_useNatives, g_frameHookHits, (unsigned long)g_gameThreadId,
+            Log("alive en=%d nat=%d fhh=%d gtid=%lu timer=%d ped=%d hdg=%.0f(%d) natOK=%d inTrain=%d inCar=%d ragdoll=%d head=(%.1f,%.1f,%.1f) csOK=%d csIdx=%d csPed=(%.1f,%.1f,%.1f) nikoModel=0x%08X modelMatch=%d exc=%d ecode=0x%08X eaddr=0x%p cs='%s'",
+                g_enabled, g_useNatives, g_frameHookHits, (unsigned long)g_gameThreadId,
                 g_natTimer, g_natDbgPed, g_charHeading, g_headingOK,
                 g_natOK, g_inTrain, g_inCar, g_isRagdoll,
                 g_headW[0], g_headW[1], g_headW[2], g_csPedOK, g_csIndex,
@@ -1839,6 +2163,7 @@ static DWORD WINAPI Worker(LPVOID)
 static DWORD WINAPI Init(LPVOID)
 {
     Log("=== Init  FirstPersonCutscene " FPMOD_VERSION " ===");
+    LoadIni(true);      // creates FirstPersonCutscene.ini with the defaults on first run
     Sleep(4000);
     if (!GetMainModuleRange(g_moduleBase, g_moduleSize)) { Log("module range failed"); return 0; }
     Log("module base=0x%p size=0x%X", (void*)g_moduleBase, (unsigned)g_moduleSize);
@@ -1848,7 +2173,7 @@ static DWORD WINAPI Init(LPVOID)
     InstallMouseHook();
     bool fh = InstallFrameHook();
     Log("game-process hook: %d", fh);
-    Log(ok ? "init ok -- F7 enable, F10 mode 3 = FP" : "camera hook FAILED");
+    Log(ok ? "init ok -- toggle key enables first person" : "camera hook FAILED");
     CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     return 0;
 }
@@ -1860,6 +2185,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID)
         g_selfInst = h;
         DisableThreadLibraryCalls(h);
         BuildLogPath();
+        BuildIniPath();
         Log("=== DllMain attach ===");
         CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
     }
