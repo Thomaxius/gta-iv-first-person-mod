@@ -53,7 +53,7 @@
 // actually pushed to GitHub; everything after it is unpublished local WIP until
 // the next real tag. Bump the alphaN suffix each time a new build gets handed
 // over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.4.1-alpha2"
+#define FPMOD_VERSION "0.4.1-alpha4"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
@@ -83,6 +83,13 @@ static uintptr_t         g_frameInsn = 0;      // the "inc [frameCount]" instruc
 static uintptr_t         g_frameReturn = 0;
 static uint8_t* g_userPause = nullptr;
 static uint8_t* g_codePause = nullptr;
+// The Esc menu (and script / code pauses) freeze the game, but the camera hook keeps firing and the mouse
+// keeps delivering deltas -- they steer the menu cursor. Without checking this the view kept turning
+// behind the menu. Plain byte reads of CTimer's flags, safe from any thread.
+static inline bool GamePaused()
+{
+    return (g_userPause && *(volatile const uint8_t*)g_userPause) || (g_codePause && *(volatile const uint8_t*)g_codePause);
+}
 static uint32_t          g_lastLookFrame = 0;
 static volatile LONG     g_mouseDX = 0, g_mouseDY = 0;   // from GetRawInputData hook (fallback)
 static volatile int      g_mouseOK = 0;
@@ -559,6 +566,18 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
 
         if (!g_enabled) return;
 
+        // Esc menu: its Map page is drawn through this same camera, so overriding it garbles the map (it only
+        // showed with first person switched off). Hand the frame back untouched while the pause menu is up.
+        // userPause only -- codePause is a script pause and can flip mid-gameplay, which would flash the game camera.
+        if (g_userPause && *(volatile const uint8_t*)g_userPause)
+        {
+            // still swallow the mouse (it steers the menu cursor) so nothing bursts into the view on resume
+            g_lastLookFrame = g_frameCount ? *g_frameCount : (g_hits >> 3);
+            InterlockedExchange(&g_mouseDX, 0);
+            InterlockedExchange(&g_mouseDY, 0);
+            return;
+        }
+
         // ---- head-anchored FP (gameplay, vehicles, subway AND cutscenes, via natives) ----
         // pick the anchor: cutscene actor if in a cutscene, else the real head bone
         float hx, hy, hz;
@@ -688,7 +707,15 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         // falsely tripped on ordinary steep look-down (cos(74.5 deg) =~ 0.27).
         bool camUpright = g_dstRot[8] > -0.20f;
         uint32_t fc = g_frameCount ? *g_frameCount : (g_hits >> 3);
-        if (aimF)
+        if (GamePaused())
+        {
+            // Esc menu / pause: the mouse is moving the menu cursor, not the view. Swallow this frame's
+            // deltas so the view stays put and nothing bursts when the game resumes.
+            g_lastLookFrame = fc;
+            InterlockedExchange(&g_mouseDX, 0);
+            InterlockedExchange(&g_mouseDY, 0);
+        }
+        else if (aimF)
         {
             // the aim camera owns yaw/pitch right now -- drain so nothing bursts when it ends
             g_lastLookFrame = fc;
@@ -2234,6 +2261,15 @@ static DWORD WINAPI Worker(LPVOID)
         if (d[16] && !k[16]) { g_csUserOverride = 0; Log("0 un-pinned -- back to auto (niko when available)"); }
         }   // g_debugMode
         for (int i = 0; i < N; ++i) k[i] = d[i];
+
+        // log pause-state changes (Esc menu etc.): if the view ever moves behind a menu again, this shows
+        // which flag did or didn't flip
+        {
+            static int s_ps = -1;
+            const int ps = ((g_userPause && *(volatile const uint8_t*)g_userPause) ? 1 : 0) |
+                           ((g_codePause && *(volatile const uint8_t*)g_codePause) ? 2 : 0);
+            if (ps != s_ps) { Log("pause flags: user=%d code=%d", ps & 1, (ps >> 1) & 1); s_ps = ps; }
+        }
 
         if (++tick % 60 == 0)
             Log("alive en=%d nat=%d fhh=%d gtid=%lu timer=%d ped=%d hdg=%.0f(%d) natOK=%d inTrain=%d inCar=%d ragdoll=%d head=(%.1f,%.1f,%.1f) csOK=%d csIdx=%d csPed=(%.1f,%.1f,%.1f) nikoModel=0x%08X modelMatch=%d exc=%d ecode=0x%08X eaddr=0x%p cs='%s'",
