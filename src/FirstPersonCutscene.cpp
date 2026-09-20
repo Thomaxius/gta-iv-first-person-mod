@@ -49,11 +49,11 @@
 #include <cstdlib>
 #include <cmath>
 
-// Local build label, separate from the git tag. v0.2.0-beta is the last version
-// actually pushed to GitHub; everything after it is unpublished local WIP until
-// the next real tag. Bump the alphaN suffix each time a new build gets handed
-// over, reset to alpha1 and bump the base version whenever a real tag lands.
-#define FPMOD_VERSION "0.4.1-alpha4"
+// Build label shown in the log and written into the generated .ini. It matches the
+// git tag while a release is current (v0.5.0-beta); between tags, bump the base
+// version and add an alphaN suffix, bumping N each time a new build gets handed
+// over and resetting to alpha1 whenever a real tag lands.
+#define FPMOD_VERSION "0.5.0-beta"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
