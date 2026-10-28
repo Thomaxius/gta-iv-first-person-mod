@@ -5,6 +5,10 @@ much like how Zolika's trainer for older versions of GTA IV did. It is currently
 
 Disclaimer: this is completely vibe-coded over brainstorming sessions with Claude.
 
+# I recommend checking out this more active fork instead:
+https://github.com/matiaselebi/First-Person-Overhaul-IV
+https://www.nexusmods.com/gta4/mods/1565
+
 ## Installation
 You need an .asi loader such as Ultimate ASI Loader. It has also been tested only with Fusion Fix, but most likely works without it, as well.
 It is also used together with the RTX Remix compatibility mod (xoxor4d's gta4-rtx).
