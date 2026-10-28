@@ -5,7 +5,7 @@ much like how Zolika's trainer for older versions of GTA IV did. It is currently
 
 Disclaimer: this is completely vibe-coded over brainstorming sessions with Claude.
 
-# I recommend checking out this more active fork instead:
+**I recommend checking out this more active fork instead:**
 https://github.com/matiaselebi/First-Person-Overhaul-IV
 https://www.nexusmods.com/gta4/mods/1565
 
